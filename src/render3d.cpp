@@ -85,10 +85,10 @@ constexpr int INITIAL_FAR_SUBMAP_RADIUS = 128;
 constexpr int FAR_MEMORY_RADIUS = 128;
 constexpr int FAR_LOD_LEVEL_INSTANCES =
     ( ( FAR_SUBMAP_RADIUS * 2 + 1 ) * ( FAR_SUBMAP_RADIUS * 2 + 1 ) -
-      VIEW_SIZE * VIEW_SIZE ) * 2;
+      VIEW_SIZE *VIEW_SIZE ) * 2;
 constexpr int INITIAL_FAR_LOD_INSTANCES =
     ( ( INITIAL_FAR_SUBMAP_RADIUS * 2 + 1 ) * ( INITIAL_FAR_SUBMAP_RADIUS * 2 + 1 ) -
-      VIEW_SIZE * VIEW_SIZE ) * 2;
+      VIEW_SIZE *VIEW_SIZE ) * 2;
 constexpr int FAR_LOD_MAX_INSTANCES = FAR_LOD_LEVEL_INSTANCES * ( OVERMAP_HEIGHT + 1 );
 // cross-level rendering: all z-levels stacked LEVEL_HEIGHT apart
 // a tile can yield up to 6 instances (floor + object + furniture + creature + item + item highlight)
@@ -2652,7 +2652,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
     const auto gather_structure_tile = [&]( const ter_t & t, const point d, const float wz,
     const tile_tone * tone, const bool memory ) -> bool {
         const structure_traits &traits = structure_traits_for( t )->second;
-        if( traits.no_floor && !traits.is_tree && !traits.is_shrub ) {
+        if( traits.no_floor && !traits.is_tree && !traits.is_shrub )
+        {
             return false;
         }
         const float shade = tone ? tone->shade : 1.0f;
@@ -2662,7 +2663,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
         const float b = 0.45f * shade;
         const sprite_info untextured;
         bool drew = false;
-        if( traits.draw_floor && count < MAX_DRAW_INSTANCES ) {
+        if( traits.draw_floor && count < MAX_DRAW_INSTANCES )
+        {
             std::vector<float> &v = structure_bucket_for( MODE_BOX );
             push_instance( v, static_cast<float>( d.x ), static_cast<float>( d.y ),
                            wz - FLOOR_THICK - 0.001f, 1.0f, 1.0f, FLOOR_THICK, untextured,
@@ -2670,7 +2672,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
             ++count;
             drew = true;
         }
-        if( traits.is_wall && count < MAX_DRAW_INSTANCES ) {
+        if( traits.is_wall && count < MAX_DRAW_INSTANCES )
+        {
             std::vector<float> &v = structure_bucket_for( MODE_BOX );
             push_instance( v, static_cast<float>( d.x ), static_cast<float>( d.y ), wz,
                            1.0f, 1.0f, WALL_HEIGHT, untextured, r, g, b,
@@ -2678,7 +2681,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
             ++count;
             drew = true;
         }
-        if( ( traits.is_tree || traits.is_shrub ) && count < MAX_DRAW_INSTANCES ) {
+        if( ( traits.is_tree || traits.is_shrub ) && count < MAX_DRAW_INSTANCES )
+        {
             const float height = traits.is_shrub ? SHRUB_HEIGHT : TREE_HEIGHT;
             std::vector<float> &v = structure_bucket_for( MODE_XQUAD );
             push_instance( v, static_cast<float>( d.x ), static_cast<float>( d.y ), wz,
@@ -2759,9 +2763,9 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
         const level_cache &sight_cache = here.get_cache_ref( observer_pos.z() );
         for( int i = 1; i <= steps; ++i ) {
             const int x = observer_pos.x() + static_cast<int>( std::lround(
-                                  static_cast<double>( dx ) * i / steps ) );
+                              static_cast<double>( dx ) * i / steps ) );
             const int y = observer_pos.y() + static_cast<int>( std::lround(
-                                  static_cast<double>( dy ) * i / steps ) );
+                              static_cast<double>( dy ) * i / steps ) );
             const int rx = x - observer_pos.x();
             const int ry = y - observer_pos.y();
             if( rx * rx + ry * ry > VIEW_RADIUS * VIEW_RADIUS ) {
@@ -5149,8 +5153,12 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                 const tripoint_abs_ms column_abs = project_to<coords::ms>( column_pos );
                 const point smd( column_abs.x() - center_abs.x(), column_abs.y() - center_abs.y() );
                 int max_corner_range2 = 0;
-                for( const int x : { smd.x, smd.x + SEEX - 1 } ) {
-                    for( const int y : { smd.y, smd.y + SEEY - 1 } ) {
+                for( const int x : {
+                         smd.x, smd.x + SEEX - 1
+                     } ) {
+                    for( const int y : {
+                             smd.y, smd.y + SEEY - 1
+                         } ) {
                         max_corner_range2 = std::max( max_corner_range2, x * x + y * y );
                     }
                 }
@@ -5583,7 +5591,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     const mat4 proj = mat4_perspective( 40.0f * 3.14159265f / 180.0f,
                                         static_cast<float>( w ) / static_cast<float>( h ),
                                         0.5f, std::max( 300.0f,
-                                                        static_cast<float>( FAR_SUBMAP_RADIUS + 64 ) ) );
+                                                static_cast<float>( FAR_SUBMAP_RADIUS + 64 ) ) );
     const mat4 mvp = mat4_mul( proj, view );
     const view_frustum frustum = make_view_frustum( mvp );
 

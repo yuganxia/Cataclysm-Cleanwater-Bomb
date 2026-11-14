@@ -699,7 +699,7 @@ void map::update_map_memory( avatar &you )
     // downward range. Lower stale caches must never become new memories.
     const int lowest_vis_z = cross_level_memory ?
                              std::max( std::min( z, here.observer_position( you ).z() -
-                                                 here.observer_z_range( you ) ), -OVERMAP_DEPTH ) : z;
+                                       here.observer_z_range( you ) ), -OVERMAP_DEPTH ) : z;
     const int highest_mem_z = cross_level_memory ? OVERMAP_HEIGHT : z;
 
     // Ensure the player's map-memory cache covers the window this pass is about
@@ -737,14 +737,16 @@ void map::update_map_memory( avatar &you )
             continue;
         }
         const auto lighting_at = [&]( const tripoint_bub_ms & p ) -> lit_level {
-            if( mem_z <= z ) {
+            if( mem_z <= z )
+            {
                 return ch.visibility_cache[p.x()][p.y()];
             }
             // Upper levels have no freshly rebuilt visibility_cache. Match the
             // 3D renderer: cheap sight rejection, then apparent light on demand.
             if( ch.seen_cache[p.x()][p.y()] <= 0.0f &&
                 ch.camera_cache[p.x()][p.y()] <= 0.0f &&
-                cache.u_clairvoyance <= 0 && !cache.clairvoyance_field ) {
+                cache.u_clairvoyance <= 0 && !cache.clairvoyance_field )
+            {
                 return lit_level::BLANK;
             }
             return here.apparent_light_at( p, cache );
