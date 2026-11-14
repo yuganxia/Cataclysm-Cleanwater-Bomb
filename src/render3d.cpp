@@ -2527,7 +2527,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
         const bucket_key key{ mode, atlas };
         const auto it = bucket_index.find( key );
         if( it != bucket_index.end() ) {
-            return ( buckets[it->second].data );
+            // Parentheses preserve the reference return with decltype(auto).
+            return ( buckets[it->second].data ); // NOLINT(cata-redundant-parentheses)
         }
         const size_t index = bucket_count++;
         bucket_index[key] = index;
@@ -2539,7 +2540,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
         } else {
             buckets.push_back( instance_bucket{ mode, atlas, {} } );
         }
-        return ( buckets[index].data );
+        // Parentheses preserve the reference return with decltype(auto).
+        return ( buckets[index].data ); // NOLINT(cata-redundant-parentheses)
     };
     // total instances pushed (all kinds), capped at the buffer capacity
     int count = 0;
@@ -2619,7 +2621,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
             bucket_for( mode, nullptr );
             cached = bucket_index.at( bucket_key{ mode, nullptr } );
         }
-        return ( buckets[cached].data );
+        // Parentheses preserve the reference return with decltype(auto).
+        return ( buckets[cached].data ); // NOLINT(cata-redundant-parentheses)
     };
     struct structure_traits {
         bool no_floor = false;
@@ -2754,18 +2757,17 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
             return visible;
         };
         const tripoint_bub_ms target_bub = here.get_bub( target );
-        const int dx = target_bub.x() - observer_pos.x();
-        const int dy = target_bub.y() - observer_pos.y();
-        const int steps = std::max( std::abs( dx ), std::abs( dy ) );
+        const point d( target_bub.x() - observer_pos.x(), target_bub.y() - observer_pos.y() );
+        const int steps = std::max( std::abs( d.x ), std::abs( d.y ) );
         if( steps == 0 ) {
             return cache_result( true );
         }
         const level_cache &sight_cache = here.get_cache_ref( observer_pos.z() );
         for( int i = 1; i <= steps; ++i ) {
             const int x = observer_pos.x() + static_cast<int>( std::lround(
-                              static_cast<double>( dx ) * i / steps ) );
+                              static_cast<double>( d.x ) * i / steps ) );
             const int y = observer_pos.y() + static_cast<int>( std::lround(
-                              static_cast<double>( dy ) * i / steps ) );
+                              static_cast<double>( d.y ) * i / steps ) );
             const int rx = x - observer_pos.x();
             const int ry = y - observer_pos.y();
             if( rx * rx + ry * ry > VIEW_RADIUS * VIEW_RADIUS ) {
@@ -5188,10 +5190,10 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                 if( !any_in_frustum ) {
                     continue;
                 }
-                const int nearest_x = std::clamp( 0, smd.x, smd.x + SEEX - 1 );
-                const int nearest_y = std::clamp( 0, smd.y, smd.y + SEEY - 1 );
+                const point nearest( std::clamp( 0, smd.x, smd.x + SEEX - 1 ),
+                                     std::clamp( 0, smd.y, smd.y + SEEY - 1 ) );
                 const bool memory_possible =
-                    nearest_x * nearest_x + nearest_y * nearest_y <= FAR_MEMORY_RADIUS * FAR_MEMORY_RADIUS;
+                    nearest.x * nearest.x + nearest.y * nearest.y <= FAR_MEMORY_RADIUS * FAR_MEMORY_RADIUS;
                 // The existing observer-level LOS gate is shared by the column;
                 // memory remains independent of it on every level.
                 const bool gray_visible = gray_los_visible(
@@ -5243,7 +5245,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                     }
                     for( int ly = 0; ly < SEEY; ++ly ) {
                         for( int lx = 0; lx < SEEX; ++lx ) {
-                            const point d( smd.x + lx, smd.y + ly );
+                            const point d = smd + point( lx, ly );
                             const int range2 = d.x * d.x + d.y * d.y;
                             if( range2 <= VIEW_RADIUS * VIEW_RADIUS ||
                                 range2 > FAR_SUBMAP_RADIUS * FAR_SUBMAP_RADIUS ) {
