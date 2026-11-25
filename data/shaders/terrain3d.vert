@@ -28,6 +28,8 @@ layout(location = 2) out float v_flags;
 layout(location = 3) out float v_shade;
 layout(location = 4) out vec3 v_world;
 layout(location = 5) out vec2 v_screen;
+layout(location = 6) out float v_sun;
+layout(location = 7) out vec3 v_tile;
 
 void main()
 {
@@ -35,6 +37,7 @@ void main()
     vec3 world;
     vec2 uv_local;
     float shade;
+    float sun_shade = 0.0;
     if( mode == 2 || mode == 3 ) {
         // yaw billboard: rotate the bottom-centered quad around world-up to face
         // the camera; mode 3 snaps the facing to the nearest cardinal axis so
@@ -86,7 +89,9 @@ void main()
         // same sun shading as a box top face (normal = +z)
         vec3 light_dir = sun_dir.w > 0.5 ? normalize( sun_dir.xyz )
                          : normalize( vec3( 0.4, 0.3, 0.85 ) );
-        shade = 0.55 + 0.45 * max( light_dir.z, 0.0 );
+        float ndotl = max( light_dir.z, 0.0 );
+        shade = 0.55 + 0.45 * ndotl;
+        sun_shade = sun_dir.w > 0.5 ? 0.45 * ndotl : 0.0;
     } else if( mode == 1 ) {
         // static crossed quad pair; uv comes from the vertex
         world = a_inst_pos + a_pos * a_inst_scale;
@@ -135,7 +140,10 @@ void main()
                          : normalize( vec3( 0.4, 0.3, 0.85 ) );
         float diff = max( dot( n, light_dir ), 0.0 );
         shade = 0.55 + 0.45 * diff;
+        sun_shade = sun_dir.w > 0.5 ? 0.45 * diff : 0.0;
     }
+    v_tile = a_inst_pos;
+    v_sun = sun_shade;
     v_world = world;
     gl_Position = mvp * vec4( world, 1.0 );
     vec2 ndc = gl_Position.xy / gl_Position.w;

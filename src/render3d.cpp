@@ -6,6 +6,7 @@
 #include <array>
 #include <bitset>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -148,6 +149,11 @@ struct distant_terrain_snapshot {
 constexpr int INSTANCE_STRIDE = 64;
 
 constexpr float LEVEL_HEIGHT = 2.6f;
+constexpr int SHADOW_MAP_SIZE = 2048;
+constexpr int LIGHT_TEXTURE_WIDTH = MAPSIZE_X;
+constexpr int LIGHT_TEXTURE_HEIGHT = MAPSIZE_Y * OVERMAP_LAYERS;
+constexpr size_t LIGHT_LAYER_BYTES = static_cast<size_t>( MAPSIZE_X ) * MAPSIZE_Y *
+                                     sizeof( smooth_lighting::lightmap_texel );
 constexpr float FLOOR_THICK = 0.1f;
 // wall tops end inside the next level's floor slab: high enough to close the
 // seam, but below the slab top so they cannot replace the upper floor surface
@@ -263,6 +269,20 @@ mat4 mat4_perspective( const float fov_y, const float aspect, const float zn, co
     return r;
 }
 
+mat4 mat4_ortho( const float left, const float right, const float bottom, const float top,
+                 const float zn, const float zf )
+{
+    mat4 r{};
+    r.c[0] = 2.0f / ( right - left );
+    r.c[5] = 2.0f / ( top - bottom );
+    r.c[10] = 1.0f / ( zn - zf );
+    r.c[12] = -( right + left ) / ( right - left );
+    r.c[13] = -( top + bottom ) / ( top - bottom );
+    r.c[14] = zn / ( zn - zf );
+    r.c[15] = 1.0f;
+    return r;
+}
+
 struct vec3 {
     float x, y, z;
 };
@@ -287,6 +307,15 @@ vec3 vec3_normalize( const vec3 &v )
 float vec3_dot( const vec3 &a, const vec3 &b )
 {
     return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+std::array<float, 4> mat4_transform( const mat4 &m, const vec3 &v )
+{
+    std::array<float, 4> out{};
+    for( int row = 0; row < 4; ++row ) {
+        out[row] = m.c[row] * v.x + m.c[4 + row] * v.y + m.c[8 + row] * v.z + m.c[12 + row];
+    }
+    return out;
 }
 
 mat4 mat4_lookat( const vec3 &eye, const vec3 &target, const vec3 &up )
@@ -408,6 +437,20 @@ bool tile_in_frustum( const view_frustum &f, const point d, const float wz )
 {
     return bounds_in_frustum( f, static_cast<float>( d.x ), static_cast<float>( d.y ),
                               static_cast<float>( d.x + 1 ), static_cast<float>( d.y + 1 ), wz );
+}
+
+bool bounds_in_frusta( const view_frustum &main, const view_frustum *casters,
+                       const float x0, const float y0, const float x1, const float y1, const float wz )
+{
+    return bounds_in_frustum( main, x0, y0, x1, y1, wz ) ||
+           ( casters && bounds_in_frustum( *casters, x0, y0, x1, y1, wz ) );
+}
+
+bool tile_in_frusta( const view_frustum &main, const view_frustum *casters, const point d,
+                     const float wz )
+{
+    return bounds_in_frusta( main, casters, static_cast<float>( d.x ), static_cast<float>( d.y ),
+                             static_cast<float>( d.x + 1 ), static_cast<float>( d.y + 1 ), wz );
 }
 
 // Unit cube, corner at origin, spanning [0,1]^3; 36 verts, pos(3f) + normal(3f).
@@ -588,8 +631,14 @@ enum class frame_slot_state {
 
 struct frame_slot {
     SDL_GPUTexture *color_tex = nullptr;
+    SDL_GPUTexture *hdr_tex = nullptr;
     SDL_GPUTexture *depth_tex = nullptr;
+    SDL_GPUTexture *shadow_tex = nullptr;
+    SDL_GPUTexture *light_tex = nullptr;
     SDL_Texture *color_tex_sdl = nullptr;
+    SDL_GPUTransferBuffer *light_tb = nullptr;
+    std::array<uint64_t, OVERMAP_LAYERS> light_generations{};
+    bool light_tint = true;
     SDL_GPUBuffer *instance_vb = nullptr;
     size_t instance_vb_size = 0;
     SDL_GPUTransferBuffer *instance_tb = nullptr;
@@ -606,6 +655,8 @@ struct context {
     // same pipeline with depth write OFF for MODE_FLATQUAD_DECAL (vehicle
     // decals): coplanar decals resolve by painter's order instead of z-fighting
     SDL_GPUGraphicsPipeline *pipeline_decal = nullptr;
+    SDL_GPUGraphicsPipeline *shadow_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline *post_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *sky_pipeline = nullptr; // far-depth background pass after the world
     cata_shader::shader tilt_shift_shader;
     cata_shader::render_state tilt_shift_state;
@@ -614,6 +665,7 @@ struct context {
     SDL_GPUBuffer *quad_vb = nullptr;
     SDL_GPUBuffer *flatquad_vb = nullptr;
     SDL_GPUSampler *sampler = nullptr;
+    SDL_GPUSampler *shadow_sampler = nullptr;
     SDL_GPUTexture *fallback_tex = nullptr; // 1x1 white, bound when a batch has no atlas
     std::array<frame_slot, FRAME_SLOT_COUNT> slots;
     int latest_ready = -1;
@@ -970,10 +1022,27 @@ void context::teardown()
                 SDL_ReleaseGPUTexture( device, slot.color_tex );
                 slot.color_tex = nullptr;
             }
+            if( slot.hdr_tex ) {
+                SDL_ReleaseGPUTexture( device, slot.hdr_tex );
+                slot.hdr_tex = nullptr;
+            }
             if( slot.depth_tex ) {
                 SDL_ReleaseGPUTexture( device, slot.depth_tex );
                 slot.depth_tex = nullptr;
             }
+            if( slot.shadow_tex ) {
+                SDL_ReleaseGPUTexture( device, slot.shadow_tex );
+                slot.shadow_tex = nullptr;
+            }
+            if( slot.light_tex ) {
+                SDL_ReleaseGPUTexture( device, slot.light_tex );
+                slot.light_tex = nullptr;
+            }
+            if( slot.light_tb ) {
+                SDL_ReleaseGPUTransferBuffer( device, slot.light_tb );
+                slot.light_tb = nullptr;
+            }
+            slot.light_generations.fill( std::numeric_limits<uint64_t>::max() );
             if( slot.instance_tb ) {
                 SDL_ReleaseGPUTransferBuffer( device, slot.instance_tb );
                 slot.instance_tb = nullptr;
@@ -1001,6 +1070,10 @@ void context::teardown()
             SDL_ReleaseGPUSampler( device, sampler );
             sampler = nullptr;
         }
+        if( shadow_sampler ) {
+            SDL_ReleaseGPUSampler( device, shadow_sampler );
+            shadow_sampler = nullptr;
+        }
         if( cube_vb ) {
             SDL_ReleaseGPUBuffer( device, cube_vb );
             cube_vb = nullptr;
@@ -1025,6 +1098,14 @@ void context::teardown()
             SDL_ReleaseGPUGraphicsPipeline( device, pipeline_decal );
             pipeline_decal = nullptr;
         }
+        if( shadow_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, shadow_pipeline );
+            shadow_pipeline = nullptr;
+        }
+        if( post_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, post_pipeline );
+            post_pipeline = nullptr;
+        }
         if( sky_pipeline ) {
             SDL_ReleaseGPUGraphicsPipeline( device, sky_pipeline );
             sky_pipeline = nullptr;
@@ -1042,7 +1123,7 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
     bool ready = g_ctx.tex_w == w && g_ctx.tex_h == h;
     if( ready ) {
         for( const frame_slot &slot : g_ctx.slots ) {
-            ready = ready && slot.color_tex && slot.depth_tex && slot.color_tex_sdl;
+            ready = ready && slot.color_tex && slot.hdr_tex && slot.depth_tex && slot.color_tex_sdl;
         }
     }
     if( ready ) {
@@ -1061,10 +1142,27 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
             SDL_ReleaseGPUTexture( g_ctx.device, slot.color_tex );
             slot.color_tex = nullptr;
         }
+        if( slot.hdr_tex ) {
+            SDL_ReleaseGPUTexture( g_ctx.device, slot.hdr_tex );
+            slot.hdr_tex = nullptr;
+        }
         if( slot.depth_tex ) {
             SDL_ReleaseGPUTexture( g_ctx.device, slot.depth_tex );
             slot.depth_tex = nullptr;
         }
+        if( slot.shadow_tex ) {
+            SDL_ReleaseGPUTexture( g_ctx.device, slot.shadow_tex );
+            slot.shadow_tex = nullptr;
+        }
+        if( slot.light_tex ) {
+            SDL_ReleaseGPUTexture( g_ctx.device, slot.light_tex );
+            slot.light_tex = nullptr;
+        }
+        if( slot.light_tb ) {
+            SDL_ReleaseGPUTransferBuffer( g_ctx.device, slot.light_tb );
+            slot.light_tb = nullptr;
+        }
+        slot.light_generations.fill( std::numeric_limits<uint64_t>::max() );
     }
 
     for( frame_slot &slot : g_ctx.slots ) {
@@ -1084,6 +1182,14 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
             return false;
         }
 
+        ci.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+        slot.hdr_tex = SDL_CreateGPUTexture( g_ctx.device, &ci );
+        if( !slot.hdr_tex ) {
+            write_status( "ensure_targets failed: HDR color target: " + std::string( SDL_GetError() ) );
+            DebugLog( D_ERROR, DC_ALL ) << "render3d: HDR color target creation failed: " << SDL_GetError();
+            return false;
+        }
+
         ci.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
         ci.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
         slot.depth_tex = SDL_CreateGPUTexture( g_ctx.device, &ci );
@@ -1092,6 +1198,29 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
             DebugLog( D_ERROR, DC_ALL ) << "render3d: depth target creation failed: " << SDL_GetError();
             return false;
         }
+
+        ci.width = SHADOW_MAP_SIZE;
+        ci.height = SHADOW_MAP_SIZE;
+        ci.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        slot.shadow_tex = SDL_CreateGPUTexture( g_ctx.device, &ci );
+        if( !slot.shadow_tex ) {
+            write_status( "shadow map unavailable: " + std::string( SDL_GetError() ) );
+        }
+
+        ci.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        ci.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        ci.width = LIGHT_TEXTURE_WIDTH;
+        ci.height = LIGHT_TEXTURE_HEIGHT;
+        slot.light_tex = SDL_CreateGPUTexture( g_ctx.device, &ci );
+        SDL_GPUTransferBufferCreateInfo light_ti{};
+        light_ti.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+        light_ti.size = static_cast<Uint32>( LIGHT_LAYER_BYTES * OVERMAP_LAYERS );
+        slot.light_tb = SDL_CreateGPUTransferBuffer( g_ctx.device, &light_ti );
+        if( !slot.light_tex || !slot.light_tb ) {
+            write_status( "colored-light texture unavailable; using white light hue" );
+        }
+        slot.light_generations.fill( std::numeric_limits<uint64_t>::max() );
+        slot.light_tint = true;
 
         SDL_PropertiesID props = SDL_CreateProperties();
         SDL_SetPointerProperty( props, SDL_PROP_TEXTURE_CREATE_GPU_TEXTURE_POINTER, slot.color_tex );
@@ -1115,6 +1244,74 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
 
     g_ctx.tex_w = w;
     g_ctx.tex_h = h;
+    return true;
+}
+
+bool upload_light_hue( SDL_GPUCommandBuffer *cmd, frame_slot &slot, map &here )
+{
+    if( !slot.light_tex || !slot.light_tb ) {
+        return false;
+    }
+    const bool tint = get_option<bool>( "COLORED_LIGHTING" );
+    if( slot.light_tint != tint ) {
+        slot.light_generations.fill( std::numeric_limits<uint64_t>::max() );
+        slot.light_tint = tint;
+    }
+    bool any_update = false;
+    for( int z = -OVERMAP_DEPTH; z <= OVERMAP_HEIGHT; ++z ) {
+        const level_cache &cache = here.get_cache_ref( z );
+        any_update = any_update || slot.light_generations[z + OVERMAP_DEPTH] != cache.lightmap_generation;
+    }
+    if( !any_update ) {
+        return true;
+    }
+    auto *mapped = static_cast<std::byte *>( SDL_MapGPUTransferBuffer( g_ctx.device, slot.light_tb,
+                      false ) );
+    if( !mapped ) {
+        return false;
+    }
+    SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass( cmd );
+    if( !copy ) {
+        SDL_UnmapGPUTransferBuffer( g_ctx.device, slot.light_tb );
+        return false;
+    }
+    std::vector<smooth_lighting::lightmap_texel> pixels( static_cast<size_t>( MAPSIZE_X ) * MAPSIZE_Y );
+    const std::array<float, 3> white{ 1.0f, 1.0f, 1.0f };
+    for( int z = -OVERMAP_DEPTH; z <= OVERMAP_HEIGHT; ++z ) {
+        const int layer = z + OVERMAP_DEPTH;
+        const level_cache &cache = here.get_cache_ref( z );
+        if( slot.light_generations[layer] == cache.lightmap_generation ) {
+            continue;
+        }
+        for( int y = 0; y < MAPSIZE_Y; ++y ) {
+            for( int x = 0; x < MAPSIZE_X; ++x ) {
+                const std::array<float, 3> hue = tint && cache.has_colored_lights
+                                                 ? smooth_lighting::illumination_hue( cache.light_color_cache[x][y],
+                                                         cache.lm[x][y].max() )
+                                                 : white;
+                const bool barrier = cache.transparency_cache[x][y] <= LIGHT_TRANSPARENCY_SOLID;
+                pixels[x + y * MAPSIZE_X] = smooth_lighting::encode_light_texel( { 1.0f, true }, hue,
+                                            barrier );
+            }
+        }
+        const size_t offset = static_cast<size_t>( layer ) * LIGHT_LAYER_BYTES;
+        std::memcpy( mapped + offset, pixels.data(), LIGHT_LAYER_BYTES );
+        SDL_GPUTextureTransferInfo src{};
+        src.transfer_buffer = slot.light_tb;
+        src.offset = static_cast<Uint32>( offset );
+        src.pixels_per_row = MAPSIZE_X;
+        src.rows_per_layer = MAPSIZE_Y;
+        SDL_GPUTextureRegion dst{};
+        dst.texture = slot.light_tex;
+        dst.y = layer * MAPSIZE_Y;
+        dst.w = MAPSIZE_X;
+        dst.h = MAPSIZE_Y;
+        dst.d = 1;
+        SDL_UploadToGPUTexture( copy, &src, &dst, false );
+        slot.light_generations[layer] = cache.lightmap_generation;
+    }
+    SDL_EndGPUCopyPass( copy );
+    SDL_UnmapGPUTransferBuffer( g_ctx.device, slot.light_tb );
     return true;
 }
 
@@ -1249,7 +1446,7 @@ bool probe( SDL_Renderer *renderer )
     g_ctx.device = device;
 
     SDL_GPUShader *vs = load_shader( device, "terrain3d.vert", SDL_GPU_SHADERSTAGE_VERTEX, 1 );
-    SDL_GPUShader *fs = load_shader( device, "terrain3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
+    SDL_GPUShader *fs = load_shader( device, "terrain3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 3 );
     if( !vs || !fs ) {
         if( vs ) {
             SDL_ReleaseGPUShader( device, vs );
@@ -1324,7 +1521,7 @@ bool probe( SDL_Renderer *renderer )
     pi.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_LESS;
     pi.target_info.num_color_targets = 1;
     SDL_GPUColorTargetDescription color_desc{};
-    color_desc.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    color_desc.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
     pi.target_info.color_target_descriptions = &color_desc;
     pi.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
     pi.target_info.has_depth_stencil_target = true;
@@ -1343,6 +1540,33 @@ bool probe( SDL_Renderer *renderer )
         write_status( "unavailable: pipeline creation failed: " + std::string( SDL_GetError() ) );
         g_ctx.teardown();
         return false;
+    }
+
+    SDL_GPUShader *shadow_vs = load_shader( device, "terrain3d.vert", SDL_GPU_SHADERSTAGE_VERTEX, 1 );
+    SDL_GPUShader *shadow_fs = load_shader( device, "terrain3d_shadow.frag",
+                                            SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 1 );
+    if( shadow_vs && shadow_fs ) {
+        SDL_GPUGraphicsPipelineCreateInfo shpi = pi;
+        shpi.vertex_shader = shadow_vs;
+        shpi.fragment_shader = shadow_fs;
+        shpi.depth_stencil_state.enable_depth_write = true;
+        shpi.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_LESS;
+        shpi.target_info.num_color_targets = 0;
+        shpi.target_info.color_target_descriptions = nullptr;
+        shpi.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+        shpi.target_info.has_depth_stencil_target = true;
+        g_ctx.shadow_pipeline = SDL_CreateGPUGraphicsPipeline( device, &shpi );
+        if( !g_ctx.shadow_pipeline ) {
+            write_status( "shadow pipeline unavailable; sun shadows disabled" );
+        }
+    } else {
+        write_status( "shadow shaders missing; sun shadows disabled" );
+    }
+    if( shadow_vs ) {
+        SDL_ReleaseGPUShader( device, shadow_vs );
+    }
+    if( shadow_fs ) {
+        SDL_ReleaseGPUShader( device, shadow_fs );
     }
 
     // sky pass pipeline: a fullscreen triangle at far depth, drawn after the
@@ -1365,7 +1589,7 @@ bool probe( SDL_Renderer *renderer )
         spi.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
         spi.target_info.num_color_targets = 1;
         SDL_GPUColorTargetDescription scolor_desc{};
-        scolor_desc.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        scolor_desc.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
         spi.target_info.color_target_descriptions = &scolor_desc;
         spi.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
         spi.target_info.has_depth_stencil_target = true;
@@ -1381,6 +1605,33 @@ bool probe( SDL_Renderer *renderer )
     }
     if( sky_fs ) {
         SDL_ReleaseGPUShader( device, sky_fs );
+    }
+
+    SDL_GPUShader *post_vs = load_shader( device, "post3d.vert", SDL_GPU_SHADERSTAGE_VERTEX, 0 );
+    SDL_GPUShader *post_fs = load_shader( device, "tonemap3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 1 );
+    if( post_vs && post_fs ) {
+        SDL_GPUGraphicsPipelineCreateInfo ppi{};
+        ppi.vertex_shader = post_vs;
+        ppi.fragment_shader = post_fs;
+        ppi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+        ppi.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+        ppi.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+        ppi.target_info.num_color_targets = 1;
+        SDL_GPUColorTargetDescription pcolor_desc{};
+        pcolor_desc.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        ppi.target_info.color_target_descriptions = &pcolor_desc;
+        g_ctx.post_pipeline = SDL_CreateGPUGraphicsPipeline( device, &ppi );
+    }
+    if( post_vs ) {
+        SDL_ReleaseGPUShader( device, post_vs );
+    }
+    if( post_fs ) {
+        SDL_ReleaseGPUShader( device, post_fs );
+    }
+    if( !g_ctx.post_pipeline ) {
+        write_status( "unavailable: HDR post pipeline creation failed" );
+        g_ctx.teardown();
+        return false;
     }
 
     // Optional final-composite tilt-shift. Missing artifacts fall back to the
@@ -1434,6 +1685,10 @@ bool probe( SDL_Renderer *renderer )
     si.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
     si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
     g_ctx.sampler = SDL_CreateGPUSampler( device, &si );
+    g_ctx.shadow_sampler = SDL_CreateGPUSampler( device, &si );
+    if( !g_ctx.shadow_sampler ) {
+        write_status( "shadow sampler unavailable; sun shadows disabled" );
+    }
     if( !g_ctx.sampler ) {
         DebugLog( D_ERROR, DC_ALL ) << "render3d: sampler creation failed: " << SDL_GetError();
         write_status( "unavailable: sampler creation failed" );
@@ -2434,7 +2689,8 @@ struct region_cull_mask {
 
 region_cull_mask build_region_cull_mask( map &here, const avatar &you,
         const tripoint_bub_ms &center, const int zlev, const int lowest_vis_z,
-        const visibility_variables &vis_vars, const view_frustum &frustum )
+        const visibility_variables &vis_vars, const view_frustum &frustum,
+        const view_frustum *caster_frustum )
 {
     region_cull_mask result;
     const int cz = center.z();
@@ -2462,10 +2718,10 @@ region_cull_mask build_region_cull_mask( map &here, const avatar &you,
             const int y0 = std::max( min_y, smy * SEEY );
             const int y1 = std::min( max_y, smy * SEEY + SEEY - 1 );
             uint8_t &state = result.state[smx + smy * MAPSIZE];
-            if( !bounds_in_frustum( frustum, static_cast<float>( x0 - center.x() ),
-                                    static_cast<float>( y0 - center.y() ),
-                                    static_cast<float>( x1 + 1 - center.x() ),
-                                    static_cast<float>( y1 + 1 - center.y() ), wz ) ) {
+            if( !bounds_in_frusta( frustum, caster_frustum, static_cast<float>( x0 - center.x() ),
+                                   static_cast<float>( y0 - center.y() ),
+                                   static_cast<float>( x1 + 1 - center.x() ),
+                                   static_cast<float>( y1 + 1 - center.y() ), wz ) ) {
                 state = REGION_FRUSTUM_SKIP;
                 ++result.skipped_submaps;
                 continue;
@@ -2646,7 +2902,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                       std::vector<instance_bucket> &buckets, size_t &bucket_count,
                       std::vector<decal_instance> &decals,
                       std::vector<decal_instance> &panels,
-                      const view_frustum &frustum )
+                      const view_frustum &frustum, const view_frustum *caster_frustum )
 {
     map &here = get_map();
     bucket_count = 0;
@@ -2963,7 +3219,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
         for( int dy = -REGION_RADIUS; dy <= REGION_RADIUS; ++dy ) {
             for( int dx = -REGION_RADIUS; dx <= REGION_RADIUS; ++dx ) {
                 const tripoint_bub_ms p = center + tripoint( dx, dy, 0 );
-                if( !here.inbounds( p ) || !tile_in_frustum( frustum, point( dx, dy ), 0.0f ) ) {
+                if( !here.inbounds( p ) || !tile_in_frusta( frustum, caster_frustum, point( dx, dy ), 0.0f ) ) {
                     continue;
                 }
                 const point r = point( dx, dy ) - pd;
@@ -3466,7 +3722,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
         const float wz = dz * LEVEL_HEIGHT;
         const level_cache &cache = here.get_cache_ref( zlev );
         const region_cull_mask cull_mask = build_region_cull_mask( here, you, center, zlev,
-                                           lowest_vis_z, vis_vars, frustum );
+                                           lowest_vis_z, vis_vars, frustum, caster_frustum );
         g_profile.skipped_submaps += cull_mask.skipped_submaps;
         if( cull_mask.any_submaps && !cull_mask.any_active ) {
             ++g_profile.skipped_levels;
@@ -3510,7 +3766,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                     ++g_profile.coarse_tiles;
                     continue;
                 }
-                if( !tile_in_frustum( frustum, point( dx, dy ), wz ) ) {
+                if( !tile_in_frusta( frustum, caster_frustum, point( dx, dy ), wz ) ) {
                     ++g_profile.frustum_tiles;
                     continue;
                 }
@@ -5309,7 +5565,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
         if( dz > 0 && dollhouse[( d.y + REGION_RADIUS ) * REGION_SIZE + ( d.x + REGION_RADIUS )] ) {
             continue;
         }
-        if( !tile_in_frustum( frustum, d, dz * LEVEL_HEIGHT ) ) {
+        if( !tile_in_frusta( frustum, caster_frustum, d, dz * LEVEL_HEIGHT ) ) {
             continue;
         }
         occupied.insert( p );
@@ -5516,17 +5772,23 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                 bool any_in_frustum = false;
                 for( int zlev = far_z_min; zlev <= far_z_max; ++zlev ) {
                     const float wz = ( zlev - cz ) * LEVEL_HEIGHT;
-                    if( !bounds_in_frustum( frustum, static_cast<float>( smd.x ),
-                                            static_cast<float>( smd.y ),
-                                            static_cast<float>( smd.x + SEEX ),
-                                            static_cast<float>( smd.y + SEEY ), wz ) ) {
+                    if( !bounds_in_frusta( frustum, caster_frustum, static_cast<float>( smd.x ),
+                                           static_cast<float>( smd.y ),
+                                           static_cast<float>( smd.x + SEEX ),
+                                           static_cast<float>( smd.y + SEEY ), wz ) ) {
                         continue;
                     }
-                    z_frustum[zlev - far_z_min] = bounds_fully_in_frustum(
+                    const bool fully_in_frustum = bounds_fully_in_frustum(
                                                       frustum, static_cast<float>( smd.x ),
                                                       static_cast<float>( smd.y ),
                                                       static_cast<float>( smd.x + SEEX ),
-                                                      static_cast<float>( smd.y + SEEY ), wz ) ? 2 : 1;
+                                                      static_cast<float>( smd.y + SEEY ), wz ) ||
+                                                  ( caster_frustum && bounds_fully_in_frustum(
+                                                          *caster_frustum, static_cast<float>( smd.x ),
+                                                          static_cast<float>( smd.y ),
+                                                          static_cast<float>( smd.x + SEEX ),
+                                                          static_cast<float>( smd.y + SEEY ), wz ) );
+                    z_frustum[zlev - far_z_min] = fully_in_frustum ? 2 : 1;
                     any_in_frustum = true;
                 }
                 if( !any_in_frustum ) {
@@ -5571,7 +5833,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                 range2 > FAR_SUBMAP_RADIUS * FAR_SUBMAP_RADIUS ) {
                                 continue;
                             }
-                            if( frustum_state == 1 && !tile_in_frustum( frustum, d, wz ) ) {
+                            if( frustum_state == 1 && !tile_in_frusta( frustum, caster_frustum, d, wz ) ) {
                                 continue;
                             }
                             ++g_profile.far_tiles;
@@ -5654,10 +5916,10 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
             if( sm_pos.z() < far_z_min || sm_pos.z() > far_z_max ||
                 range2 <= VIEW_RADIUS * VIEW_RADIUS ||
                 range2 > FAR_SUBMAP_RADIUS * FAR_SUBMAP_RADIUS ||
-                !bounds_in_frustum( frustum, static_cast<float>( smd.x ),
-                                    static_cast<float>( smd.y ),
-                                    static_cast<float>( smd.x + SEEX ),
-                                    static_cast<float>( smd.y + SEEY ), wz ) ||
+                !bounds_in_frusta( frustum, caster_frustum, static_cast<float>( smd.x ),
+                                   static_cast<float>( smd.y ),
+                                   static_cast<float>( smd.x + SEEX ),
+                                   static_cast<float>( smd.y + SEEY ), wz ) ||
                 !gray_los_visible( sm_abs + point_rel_ms( SEEX / 2, SEEY / 2 ) ) ) {
                 continue;
             }
@@ -6067,6 +6329,39 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     const mat4 mvp = mat4_mul( proj, view );
     const view_frustum frustum = make_view_frustum( mvp );
 
+    // daylight + sun position from the game calendar. azimuth is measured FROM
+    // the south, positive toward the west (calendar.cpp); scene coords are
+    // x = east, y = south, z = up
+    const level_cache &cache = here.get_cache_ref( center.z() );
+    const float daylight = std::clamp( cache.natural_light_level_cache / LIGHT_AMBIENT_LIT,
+                                       0.0f, 1.0f );
+    const auto sun_aa = sun_azimuth_altitude( calendar::turn );
+    const float sun_az = static_cast<float>( units::to_degrees( sun_aa.first ) ) *
+                         3.14159265f / 180.0f;
+    const float sun_alt = static_cast<float>( units::to_degrees( sun_aa.second ) ) *
+                          3.14159265f / 180.0f;
+    const vec3 sun_dir{ -std::sin( sun_az ) *std::cos( sun_alt ),
+                        std::cos( sun_az ) *std::cos( sun_alt ),
+                        std::sin( sun_alt ) };
+    const bool sun_up = sun_alt > 0.0f && daylight > 0.05f;
+    const float shadow_extent = std::clamp( g_cam_dist * 2.2f, 32.0f, 72.0f );
+    const vec3 light_eye{ target.x + sun_dir.x * 80.0f,
+                          target.y + sun_dir.y * 80.0f,
+                          target.z + sun_dir.z * 80.0f };
+    const vec3 light_up = std::abs( sun_dir.z ) > 0.95f ? vec3{ 0.0f, 1.0f, 0.0f } :
+                          vec3{ 0.0f, 0.0f, 1.0f };
+    const mat4 light_view = mat4_lookat( light_eye, target, light_up );
+    const std::array<float, 4> light_center = mat4_transform( light_view, target );
+    const float shadow_texel = 2.0f * shadow_extent / SHADOW_MAP_SIZE;
+    const float light_cx = std::round( light_center[0] / shadow_texel ) * shadow_texel;
+    const float light_cy = std::round( light_center[1] / shadow_texel ) * shadow_texel;
+    const mat4 light_proj = mat4_ortho( light_cx - shadow_extent, light_cx + shadow_extent,
+                                        light_cy - shadow_extent, light_cy + shadow_extent, 0.5f, 180.0f );
+    const mat4 light_vp = mat4_mul( light_proj, light_view );
+    const view_frustum shadow_frustum = make_view_frustum( light_vp );
+    const view_frustum *caster_frustum = sun_up && g_ctx.shadow_pipeline && g_ctx.shadow_sampler
+                                         ? &shadow_frustum : nullptr;
+
     // cache the camera for screen_to_tile + the hover preselection box
     {
         g_dest = dest;
@@ -6130,7 +6425,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     size_t bucket_count = 0;
     const Uint64 gather_begin = profile_ticks( profile );
     const int count = gather_instances( tiles, center, buckets, bucket_count, decals, panels,
-                                        frustum );
+                                        frustum, caster_frustum );
     if( profile ) {
         g_profile.gather_ms = profile_ms( gather_begin, profile_ticks( true ) );
     }
@@ -6214,22 +6509,6 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     g_profile.segments = segments.size();
     g_profile.upload_bytes = inst.size() * sizeof( float );
 
-    // daylight + sun position from the game calendar. azimuth is measured FROM
-    // the south, positive toward the west (calendar.cpp); scene coords are
-    // x = east, y = south, z = up
-    const level_cache &cache = here.get_cache_ref( center.z() );
-    const float daylight = std::clamp( cache.natural_light_level_cache / LIGHT_AMBIENT_LIT,
-                                       0.0f, 1.0f );
-    const auto sun_aa = sun_azimuth_altitude( calendar::turn );
-    const float sun_az = static_cast<float>( units::to_degrees( sun_aa.first ) ) *
-                         3.14159265f / 180.0f;
-    const float sun_alt = static_cast<float>( units::to_degrees( sun_aa.second ) ) *
-                          3.14159265f / 180.0f;
-    const vec3 sun_dir{ -std::sin( sun_az ) *std::cos( sun_alt ),
-                        std::cos( sun_az ) *std::cos( sun_alt ),
-                        std::sin( sun_alt ) };
-    const bool sun_up = sun_alt > 0.0f && daylight > 0.05f;
-
     // weather-driven cloud cover: how much of the clear-sky sunlight the
     // current weather blocks. at night the ratio is meaningless; the sky is
     // dark either way, so any mid value is fine
@@ -6257,6 +6536,8 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     uniforms.cam_right = { -std::sin( g_yaw ), std::cos( g_yaw ), 0.0f, 0.0f };
     uniforms.cam_up = { 0.0f, 0.0f, 1.0f, 0.0f };
     uniforms.sun_dir = { sun_dir.x, sun_dir.y, sun_dir.z, sun_up ? 1.0f : 0.0f };
+    vert_uniforms shadow_uniforms = uniforms;
+    shadow_uniforms.mvp = light_vp;
 
     // sky pass uniforms: the camera basis reconstructs a world-space view ray
     // per pixel; the fragment shader paints gradient + sun + clouds
@@ -6299,7 +6580,12 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> nv_params;
         std::array<float, 4> cursor_params;
         std::array<float, 4> effect_params;
+        mat4 light_vp;
+        std::array<float, 4> shadow_params;
+        std::array<float, 4> light_params;
+        std::array<float, 4> light_origin;
     };
+    static_assert( sizeof( frag_uniforms ) == 18 * 16, "terrain3d fragment UBO must match std140" );
     frag_uniforms frag_ub{};
     const tripoint_bub_ms upos = get_avatar().pos_bub();
     const float player_gz = ( upos.z() - center.z() ) * LEVEL_HEIGHT;
@@ -6337,6 +6623,12 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
                                cursor_y >= 0.0f && cursor_y <= 1.0f;
     frag_ub.cursor_params = { cursor_x, cursor_y, cursor_active ? 1.0f : 0.0f, 0.0f };
     frag_ub.effect_params = { 0.075f, 0.10f, 1.0f / WALL_HEIGHT, 0.0f };
+    frag_ub.light_vp = light_vp;
+    frag_ub.shadow_params = { 0.0f, 1.0f / SHADOW_MAP_SIZE, 0.00035f, 0.0f };
+    frag_ub.light_params = { 0.0f, static_cast<float>( MAPSIZE_Y ),
+                             static_cast<float>( center.z() + OVERMAP_DEPTH ), LEVEL_HEIGHT
+                           };
+    frag_ub.light_origin = { static_cast<float>( center.x() ), static_cast<float>( center.y() ), 0.0f, 0.0f };
 
     // fallback clear color when the sky pass is unavailable
     const SDL_FColor sky{ 0.02f + 0.35f * daylight, 0.02f + 0.45f * daylight,
@@ -6366,6 +6658,12 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         publish_profile( g_profile );
         return;
     }
+
+    const bool light_hue_ready = upload_light_hue( cmd, slot, here );
+    frag_ub.light_params[0] = light_hue_ready && get_option<bool>( "COLORED_LIGHTING" ) ? 1.0f : 0.0f;
+    const bool shadows_ready = caster_frustum && slot.shadow_tex && g_ctx.shadow_pipeline &&
+                               g_ctx.shadow_sampler;
+    frag_ub.shadow_params[0] = shadows_ready ? 1.0f : 0.0f;
 
     // upload instance data. A fully culled scene still renders the sky/clear,
     // but must not create a zero-sized transfer buffer or upload.
@@ -6453,9 +6751,52 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         }
     }
 
+    if( shadows_ready ) {
+        SDL_GPUDepthStencilTargetInfo shadow_depth{};
+        shadow_depth.texture = slot.shadow_tex;
+        shadow_depth.load_op = SDL_GPU_LOADOP_CLEAR;
+        shadow_depth.store_op = SDL_GPU_STOREOP_STORE;
+        shadow_depth.clear_depth = 1.0f;
+        SDL_GPURenderPass *shadow_pass = SDL_BeginGPURenderPass( cmd, nullptr, 0, &shadow_depth );
+        SDL_BindGPUGraphicsPipeline( shadow_pass, g_ctx.shadow_pipeline );
+        SDL_GPUBufferBinding shadow_inst_bind{};
+        shadow_inst_bind.buffer = slot.instance_vb;
+        for( const draw_segment &seg : segments ) {
+            if( seg.mode == MODE_FLATQUAD_DECAL || seg.mode == MODE_LINEQUAD_DECAL ) {
+                continue;
+            }
+            SDL_GPUBufferBinding geom_bind{};
+            int verts_per_instance = 36;
+            if( seg.mode == MODE_XQUAD ) {
+                geom_bind.buffer = g_ctx.xquad_vb;
+                verts_per_instance = 12;
+            } else if( seg.mode == MODE_FLATQUAD ) {
+                geom_bind.buffer = g_ctx.flatquad_vb;
+                verts_per_instance = 6;
+            } else if( seg.mode == MODE_BILLBOARD || seg.mode == MODE_BILLBOARD_SNAP ||
+                       seg.mode == MODE_LINEQUAD ) {
+                geom_bind.buffer = g_ctx.quad_vb;
+                verts_per_instance = 6;
+            } else {
+                geom_bind.buffer = g_ctx.cube_vb;
+            }
+            const SDL_GPUBufferBinding vbs[2] = { geom_bind, shadow_inst_bind };
+            SDL_BindGPUVertexBuffers( shadow_pass, 0, vbs, 2 );
+            SDL_GPUTexture *atlas_gpu = seg.atlas ? gpu_texture_of( seg.atlas ) : g_ctx.fallback_tex;
+            SDL_GPUTextureSamplerBinding sampler_bind{};
+            sampler_bind.texture = atlas_gpu ? atlas_gpu : g_ctx.fallback_tex;
+            sampler_bind.sampler = g_ctx.sampler;
+            SDL_BindGPUFragmentSamplers( shadow_pass, 0, &sampler_bind, 1 );
+            shadow_uniforms.params = { static_cast<float>( seg.mode ), 0.0f, 0.0f, 0.0f };
+            SDL_PushGPUVertexUniformData( cmd, 0, &shadow_uniforms, sizeof( shadow_uniforms ) );
+            SDL_DrawGPUPrimitives( shadow_pass, verts_per_instance, seg.num_instances, 0, seg.first_instance );
+        }
+        SDL_EndGPURenderPass( shadow_pass );
+    }
+
     // pass 1: the world clears color/depth and writes all scene geometry.
     SDL_GPUColorTargetInfo color_target{};
-    color_target.texture = slot.color_tex;
+    color_target.texture = slot.hdr_tex;
     color_target.load_op = SDL_GPU_LOADOP_CLEAR;
     color_target.store_op = SDL_GPU_STOREOP_STORE;
     color_target.clear_color = sky;
@@ -6500,10 +6841,14 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         const SDL_GPUBufferBinding vbs[2] = { geom_bind, inst_bind };
         SDL_BindGPUVertexBuffers( pass, 0, vbs, 2 );
         SDL_GPUTexture *atlas_gpu = seg.atlas ? gpu_texture_of( seg.atlas ) : g_ctx.fallback_tex;
-        SDL_GPUTextureSamplerBinding sampler_bind{};
-        sampler_bind.texture = atlas_gpu ? atlas_gpu : g_ctx.fallback_tex;
-        sampler_bind.sampler = g_ctx.sampler;
-        SDL_BindGPUFragmentSamplers( pass, 0, &sampler_bind, 1 );
+        SDL_GPUTextureSamplerBinding sampler_binds[3]{};
+        sampler_binds[0].texture = atlas_gpu ? atlas_gpu : g_ctx.fallback_tex;
+        sampler_binds[0].sampler = g_ctx.sampler;
+        sampler_binds[1].texture = shadows_ready ? slot.shadow_tex : g_ctx.fallback_tex;
+        sampler_binds[1].sampler = shadows_ready ? g_ctx.shadow_sampler : g_ctx.sampler;
+        sampler_binds[2].texture = light_hue_ready ? slot.light_tex : g_ctx.fallback_tex;
+        sampler_binds[2].sampler = g_ctx.sampler;
+        SDL_BindGPUFragmentSamplers( pass, 0, sampler_binds, 3 );
         // decal modes share their geometry path with the plain modes
         // (6 -> flatquad 5, 7 -> fence linequad 4); the shader never sees them
         const int shader_mode = seg.mode == MODE_FLATQUAD_DECAL ? MODE_FLATQUAD :
@@ -6527,7 +6872,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     // contents are loaded, and the far-depth sky shader never writes depth.
     if( g_ctx.sky_pipeline ) {
         SDL_GPUColorTargetInfo sky_target{};
-        sky_target.texture = slot.color_tex;
+        sky_target.texture = slot.hdr_tex;
         sky_target.load_op = SDL_GPU_LOADOP_LOAD;
         sky_target.store_op = SDL_GPU_STOREOP_STORE;
         SDL_GPUDepthStencilTargetInfo sky_depth{};
@@ -6540,6 +6885,20 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         SDL_DrawGPUPrimitives( sky_pass, 3, 1, 0, 0 );
         SDL_EndGPURenderPass( sky_pass );
     }
+
+    SDL_GPUColorTargetInfo post_target{};
+    post_target.texture = slot.color_tex;
+    post_target.load_op = SDL_GPU_LOADOP_CLEAR;
+    post_target.store_op = SDL_GPU_STOREOP_STORE;
+    post_target.clear_color = { 0.0f, 0.0f, 0.0f, 1.0f };
+    SDL_GPURenderPass *post_pass = SDL_BeginGPURenderPass( cmd, &post_target, 1, nullptr );
+    SDL_BindGPUGraphicsPipeline( post_pass, g_ctx.post_pipeline );
+    SDL_GPUTextureSamplerBinding post_sampler{};
+    post_sampler.texture = slot.hdr_tex;
+    post_sampler.sampler = g_ctx.sampler;
+    SDL_BindGPUFragmentSamplers( post_pass, 0, &post_sampler, 1 );
+    SDL_DrawGPUPrimitives( post_pass, 3, 1, 0, 0 );
+    SDL_EndGPURenderPass( post_pass );
 
     if( profile ) {
         g_profile.record_ms = profile_ms( record_begin, profile_ticks( true ) );

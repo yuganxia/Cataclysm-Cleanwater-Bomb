@@ -9,6 +9,8 @@
 #include "nightvision_presets.glsl"
 
 layout(set = 2, binding = 0) uniform sampler2D atlas_tex;
+layout(set = 2, binding = 1) uniform sampler2D shadow_tex;
+layout(set = 2, binding = 2) uniform sampler2D light_tex;
 
 layout(set = 3, binding = 0) uniform FragUBO {
     vec4 eye_pos;      // xyz = camera position (scene coords)
@@ -24,6 +26,10 @@ layout(set = 3, binding = 0) uniform FragUBO {
                         // the tile light), y = night floor, z = overexpose start
     vec4 cursor_params; // xy = cursor in top-left screen UV, z = mask enabled
     vec4 effect_params; // xy = cursor ellipse radii, z = inverse full wall height
+    mat4 light_vp;
+    vec4 shadow_params; // x = enabled, y = texel size, z = depth bias
+    vec4 light_params;  // x = enabled, y = rows per z, z = center layer, w = level height
+    vec4 light_origin;  // xy = view center in map coordinates
 };
 
 layout(location = 0) in vec4 v_color;
@@ -32,8 +38,83 @@ layout(location = 2) in float v_flags;
 layout(location = 3) in float v_shade;
 layout(location = 4) in vec3 v_world;
 layout(location = 5) in vec2 v_screen;
+layout(location = 6) in float v_sun;
+layout(location = 7) in vec3 v_tile;
 
 layout(location = 0) out vec4 out_color;
+
+float sun_visibility()
+{
+    if( shadow_params.x < 0.5 || v_sun <= 0.0 ) {
+        return 1.0;
+    }
+    vec4 light_pos = light_vp * vec4( v_world, 1.0 );
+    vec3 ndc = light_pos.xyz / light_pos.w;
+    vec2 uv = vec2( ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5 );
+    if( uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 ||
+        ndc.z < 0.0 || ndc.z > 1.0 ) {
+        return 1.0;
+    }
+    float ndotl = clamp( v_sun / 0.45, 0.0, 1.0 );
+    float bias = shadow_params.z * ( 1.0 + 2.0 * ( 1.0 - ndotl ) );
+    float visible = 0.0;
+    for( int y = -1; y <= 1; ++y ) {
+        for( int x = -1; x <= 1; ++x ) {
+            vec2 offset = vec2( float( x ), float( y ) ) * shadow_params.y;
+            float depth = texture( shadow_tex, uv + offset ).r;
+            visible += ndc.z - bias <= depth ? 1.0 : 0.0;
+        }
+    }
+    return visible / 9.0;
+}
+
+vec3 light_hue()
+{
+    if( light_params.x < 0.5 ) {
+        return vec3( 1.0 );
+    }
+    int rows = int( light_params.y + 0.5 );
+    int relative_z = int( floor( ( v_tile.z + 0.5 * light_params.w ) / light_params.w ) );
+    int layer = int( light_params.z + 0.5 ) + relative_z;
+    vec2 map_xy = v_world.xy + light_origin.xy;
+    ivec2 own = ivec2( floor( map_xy ) );
+    int map_width = textureSize( light_tex, 0 ).x;
+    if( own.x < 0 || own.x >= map_width || own.y < 0 || own.y >= rows ||
+        layer < 0 || layer * rows >= textureSize( light_tex, 0 ).y ) {
+        return vec3( 1.0 );
+    }
+    vec4 own_texel = texelFetch( light_tex, ivec2( own.x, layer * rows + own.y ), 0 );
+    int own_flags = int( own_texel.a * 255.0 + 0.5 );
+    bool own_barrier = ( own_flags & 2 ) != 0;
+    vec2 st = map_xy - 0.5;
+    ivec2 base = ivec2( floor( st ) );
+    vec2 f = fract( st );
+    vec3 chroma = vec3( 0.0 );
+    float weight_sum = 0.0;
+    for( int y = 0; y <= 1; ++y ) {
+        for( int x = 0; x <= 1; ++x ) {
+            ivec2 cell = base + ivec2( x, y );
+            if( cell.x < 0 || cell.x >= map_width || cell.y < 0 || cell.y >= rows ) {
+                continue;
+            }
+            vec4 t = texelFetch( light_tex, ivec2( cell.x, layer * rows + cell.y ), 0 );
+            bool barrier = ( int( t.a * 255.0 + 0.5 ) & 2 ) != 0;
+            if( barrier != own_barrier ) {
+                continue;
+            }
+            float weight = ( x == 0 ? 1.0 - f.x : f.x ) *
+                           ( y == 0 ? 1.0 - f.y : f.y );
+            vec3 tap_chroma = vec3( t.g, t.b, max( 1.0 - t.g - t.b, 0.0 ) );
+            chroma += weight * tap_chroma;
+            weight_sum += weight;
+        }
+    }
+    if( weight_sum < 1.0e-4 ) {
+        return vec3( 1.0 );
+    }
+    chroma /= weight_sum;
+    return chroma / max( max( chroma.r, chroma.g ), max( chroma.b, 1.0e-4 ) );
+}
 
 void main()
 {
@@ -161,9 +242,11 @@ void main()
         out_color = vec4( nv * v_shade, composite_alpha );
         return;
     }
+    rgb *= light_hue();
     // low light drains color, as 2D's lit shader does; v_color.a carries the
     // tile light's saturation (1 = full color, 0 = grayscale)
     float gray = ( rgb.r + rgb.g + rgb.b ) / 3.0;
     rgb = mix( vec3( gray ), rgb, v_color.a );
-    out_color = vec4( rgb * v_shade, composite_alpha );
+    float shade = v_shade - v_sun * ( 1.0 - sun_visibility() );
+    out_color = vec4( rgb * shade, composite_alpha );
 }
