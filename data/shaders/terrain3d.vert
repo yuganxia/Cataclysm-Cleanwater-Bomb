@@ -13,6 +13,7 @@ layout(location = 5) in vec2 a_inst_uv1;    // atlas uv, bottom-right
 layout(location = 6) in vec4 a_inst_color;  // rgb = light tint
 layout(location = 7) in float a_inst_flags; // bit0: textured; bit1: no cutout; bit2-3: top uv rotation; bit4: side strip; bit8: silhouette side
 layout(location = 8) in float a_inst_pad;   // bit4 mode: strip v coordinate (sprite bottom edge)
+layout(location = 9) in vec4 a_inst_emission; // rgb = explicit light-source radiance
 
 layout(set = 1, binding = 0) uniform UBO {
     mat4 mvp;
@@ -30,6 +31,7 @@ layout(location = 4) out vec3 v_world;
 layout(location = 5) out vec2 v_screen;
 layout(location = 6) out float v_sun;
 layout(location = 7) out vec3 v_tile;
+layout(location = 8) out vec4 v_emission;
 
 void main()
 {
@@ -152,4 +154,5 @@ void main()
     v_uv = mix( a_inst_uv0, a_inst_uv1, uv_local );
     v_flags = a_inst_flags;
     v_shade = shade;
+    v_emission = a_inst_emission;
 }

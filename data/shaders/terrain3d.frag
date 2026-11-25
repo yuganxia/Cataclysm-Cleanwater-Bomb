@@ -30,6 +30,7 @@ layout(set = 3, binding = 0) uniform FragUBO {
     vec4 effect_params; // xy = cursor ellipse radii, z = inverse full wall height, w = depth only
     mat4 light_vp;
     vec4 shadow_params; // x = enabled, y = texel size, z = depth bias
+    vec4 shadow_pcss;   // x = ortho width, y = depth range, z = sun size, w = max radius in texels
     vec4 light_params;  // x = enabled, y = rows per z, z = center layer, w = level height
     vec4 light_origin;  // xy = view center in map coordinates
     vec4 atmosphere_sun; // xyz = direction toward sun, w = daylight
@@ -47,8 +48,21 @@ layout(location = 4) in vec3 v_world;
 layout(location = 5) in vec2 v_screen;
 layout(location = 6) in float v_sun;
 layout(location = 7) in vec3 v_tile;
+layout(location = 8) in vec4 v_emission;
 
 layout(location = 0) out vec4 out_color;
+layout(location = 1) out vec4 out_emissive;
+
+const vec2 shadow_poisson[16] = vec2[](
+    vec2( -0.94201624, -0.39906216 ), vec2( 0.94558609, -0.76890725 ),
+    vec2( -0.09418410, -0.92938870 ), vec2( 0.34495938, 0.29387760 ),
+    vec2( -0.91588581, 0.45771432 ), vec2( -0.81544232, -0.87912464 ),
+    vec2( -0.38277543, 0.27676845 ), vec2( 0.97484398, 0.75648379 ),
+    vec2( 0.44323325, -0.97511554 ), vec2( 0.53742981, -0.47373420 ),
+    vec2( -0.26496911, -0.41893023 ), vec2( 0.79197514, 0.19090188 ),
+    vec2( -0.24188840, 0.99706507 ), vec2( -0.81409955, 0.91437590 ),
+    vec2( 0.19984126, 0.78641367 ), vec2( 0.14383161, -0.14100790 )
+);
 
 float sun_visibility()
 {
@@ -64,15 +78,43 @@ float sun_visibility()
     }
     float ndotl = clamp( v_sun / 0.45, 0.0, 1.0 );
     float bias = shadow_params.z * ( 1.0 + 2.0 * ( 1.0 - ndotl ) );
-    float visible = 0.0;
-    for( int y = -1; y <= 1; ++y ) {
-        for( int x = -1; x <= 1; ++x ) {
-            vec2 offset = vec2( float( x ), float( y ) ) * shadow_params.y;
-            float depth = texture( shadow_tex, uv + offset ).r;
-            visible += ndc.z - bias <= depth ? 1.0 : 0.0;
+    float angle = fract( sin( dot( gl_FragCoord.xy, vec2( 12.9898, 78.233 ) ) ) *
+                         43758.5453 ) * 6.28318530718;
+    float cs = cos( angle );
+    float sn = sin( angle );
+    mat2 rotation = mat2( cs, sn, -sn, cs );
+    float search_radius = shadow_params.y * shadow_pcss.w;
+    float blocker_depth_sum = 0.0;
+    int blocker_count = 0;
+    for( int i = 0; i < 16; ++i ) {
+        vec2 sample_uv = uv + rotation * shadow_poisson[i] * search_radius;
+        if( sample_uv.x < 0.0 || sample_uv.x > 1.0 ||
+            sample_uv.y < 0.0 || sample_uv.y > 1.0 ) {
+            continue;
+        }
+        float depth = texture( shadow_tex, sample_uv ).r;
+        if( depth < ndc.z - bias ) {
+            blocker_depth_sum += depth;
+            ++blocker_count;
         }
     }
-    return visible / 9.0;
+    if( blocker_count == 0 ) {
+        return 1.0;
+    }
+
+    float blocker_depth = blocker_depth_sum / float( blocker_count );
+    float world_gap = max( ( ndc.z - blocker_depth ) * shadow_pcss.y, 0.0 );
+    float penumbra_world = world_gap * shadow_pcss.z;
+    float radius = clamp( penumbra_world / shadow_pcss.x,
+                          shadow_params.y, search_radius );
+    float filter_bias = bias * ( 1.0 + 0.25 * radius / shadow_params.y );
+    float visible = 0.0;
+    for( int i = 0; i < 16; ++i ) {
+        vec2 sample_uv = uv + rotation * shadow_poisson[i] * radius;
+        float depth = texture( shadow_tex, sample_uv ).r;
+        visible += ndc.z - filter_bias <= depth ? 1.0 : 0.0;
+    }
+    return visible / 16.0;
 }
 
 vec3 light_hue()
@@ -166,6 +208,7 @@ vec3 apply_air_perspective( vec3 rgb )
 
 void main()
 {
+    out_emissive = vec4( 0.0 );
     int flags = int( v_flags + 0.5 );
     const bool same_level_wall = ( flags & 1024 ) != 0;
     const bool mask_candidate = mask_params.w > 0.5 && !same_level_wall &&
@@ -301,6 +344,8 @@ void main()
     rgb = mix( vec3( gray ), rgb, v_color.a );
     float direct_sun = v_sun * sun_visibility() * cloud_sun_visibility();
     float shade = ( v_shade - v_sun ) * ambient_occlusion() + direct_sun;
-    vec3 lit = apply_air_perspective( rgb * shade );
+    vec3 emission = v_emission.rgb * ( textured ? sampled.rgb : vec3( 1.0 ) );
+    vec3 lit = apply_air_perspective( rgb * shade ) + emission;
     out_color = vec4( lit, composite_alpha );
+    out_emissive = vec4( emission, 1.0 );
 }

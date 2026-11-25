@@ -145,8 +145,8 @@ struct distant_terrain_snapshot {
         return terrain.empty() ? uniform_terrain : terrain[p.y() * SEEX + p.x()];
     }
 };
-// float3 pos + float3 scale + float2 uv0 + float2 uv1 + float4 color + float flags + float pad
-constexpr int INSTANCE_STRIDE = 64;
+// float3 pos + float3 scale + float2 uv0 + float2 uv1 + float4 color + float flags + float pad + float4 emission
+constexpr int INSTANCE_STRIDE = 80;
 
 constexpr float LEVEL_HEIGHT = 2.6f;
 constexpr int SHADOW_MAP_SIZE = 2048;
@@ -632,6 +632,8 @@ enum class frame_slot_state {
 struct frame_slot {
     SDL_GPUTexture *color_tex = nullptr;
     SDL_GPUTexture *hdr_tex = nullptr;
+    SDL_GPUTexture *emissive_tex = nullptr;
+    std::array<SDL_GPUTexture *, 2> bloom_tex{};
     SDL_GPUTexture *depth_tex = nullptr;
     SDL_GPUTexture *ao_raw_tex = nullptr;
     SDL_GPUTexture *ao_tex = nullptr;
@@ -654,15 +656,21 @@ struct frame_slot {
 struct context {
     SDL_GPUDevice *device = nullptr; // owned by the SDL_Renderer
     SDL_GPUGraphicsPipeline *pipeline = nullptr;
+    SDL_GPUGraphicsPipeline *pipeline_mrt = nullptr;
     // same pipeline with depth write OFF for MODE_FLATQUAD_DECAL (vehicle
     // decals): coplanar decals resolve by painter's order instead of z-fighting
     SDL_GPUGraphicsPipeline *pipeline_decal = nullptr;
+    SDL_GPUGraphicsPipeline *pipeline_decal_mrt = nullptr;
     SDL_GPUGraphicsPipeline *shadow_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *post_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline *post_bloom_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline *bloom_extract_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline *bloom_blur_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *prepass_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *gtao_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *ao_blur_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *sky_pipeline = nullptr; // far-depth background pass after the world
+    SDL_GPUGraphicsPipeline *sky_mrt_pipeline = nullptr;
     cata_shader::shader tilt_shift_shader;
     cata_shader::render_state tilt_shift_state;
     SDL_GPUBuffer *cube_vb = nullptr;
@@ -1032,6 +1040,16 @@ void context::teardown()
                 SDL_ReleaseGPUTexture( device, slot.hdr_tex );
                 slot.hdr_tex = nullptr;
             }
+            if( slot.emissive_tex ) {
+                SDL_ReleaseGPUTexture( device, slot.emissive_tex );
+                slot.emissive_tex = nullptr;
+            }
+            for( SDL_GPUTexture *&bloom : slot.bloom_tex ) {
+                if( bloom ) {
+                    SDL_ReleaseGPUTexture( device, bloom );
+                    bloom = nullptr;
+                }
+            }
             if( slot.depth_tex ) {
                 SDL_ReleaseGPUTexture( device, slot.depth_tex );
                 slot.depth_tex = nullptr;
@@ -1112,9 +1130,17 @@ void context::teardown()
             SDL_ReleaseGPUGraphicsPipeline( device, pipeline );
             pipeline = nullptr;
         }
+        if( pipeline_mrt ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, pipeline_mrt );
+            pipeline_mrt = nullptr;
+        }
         if( pipeline_decal ) {
             SDL_ReleaseGPUGraphicsPipeline( device, pipeline_decal );
             pipeline_decal = nullptr;
+        }
+        if( pipeline_decal_mrt ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, pipeline_decal_mrt );
+            pipeline_decal_mrt = nullptr;
         }
         if( shadow_pipeline ) {
             SDL_ReleaseGPUGraphicsPipeline( device, shadow_pipeline );
@@ -1123,6 +1149,18 @@ void context::teardown()
         if( post_pipeline ) {
             SDL_ReleaseGPUGraphicsPipeline( device, post_pipeline );
             post_pipeline = nullptr;
+        }
+        if( post_bloom_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, post_bloom_pipeline );
+            post_bloom_pipeline = nullptr;
+        }
+        if( bloom_extract_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, bloom_extract_pipeline );
+            bloom_extract_pipeline = nullptr;
+        }
+        if( bloom_blur_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, bloom_blur_pipeline );
+            bloom_blur_pipeline = nullptr;
         }
         if( prepass_pipeline ) {
             SDL_ReleaseGPUGraphicsPipeline( device, prepass_pipeline );
@@ -1139,6 +1177,10 @@ void context::teardown()
         if( sky_pipeline ) {
             SDL_ReleaseGPUGraphicsPipeline( device, sky_pipeline );
             sky_pipeline = nullptr;
+        }
+        if( sky_mrt_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, sky_mrt_pipeline );
+            sky_mrt_pipeline = nullptr;
         }
     } else {
         reset_frame_tracking();
@@ -1175,6 +1217,16 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
         if( slot.hdr_tex ) {
             SDL_ReleaseGPUTexture( g_ctx.device, slot.hdr_tex );
             slot.hdr_tex = nullptr;
+        }
+        if( slot.emissive_tex ) {
+            SDL_ReleaseGPUTexture( g_ctx.device, slot.emissive_tex );
+            slot.emissive_tex = nullptr;
+        }
+        for( SDL_GPUTexture *&bloom : slot.bloom_tex ) {
+            if( bloom ) {
+                SDL_ReleaseGPUTexture( g_ctx.device, bloom );
+                bloom = nullptr;
+            }
         }
         if( slot.depth_tex ) {
             SDL_ReleaseGPUTexture( g_ctx.device, slot.depth_tex );
@@ -1227,6 +1279,10 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
             DebugLog( D_ERROR, DC_ALL ) << "render3d: HDR color target creation failed: " << SDL_GetError();
             return false;
         }
+        slot.emissive_tex = SDL_CreateGPUTexture( g_ctx.device, &ci );
+        if( !slot.emissive_tex ) {
+            write_status( "emissive target unavailable; Bloom disabled" );
+        }
 
         ci.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
         ci.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
@@ -1269,6 +1325,13 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
         slot.ao_tex = SDL_CreateGPUTexture( g_ctx.device, &ci );
         if( !slot.ao_raw_tex || !slot.ao_tex ) {
             write_status( "GTAO textures unavailable; ambient occlusion disabled" );
+        }
+        ci.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+        for( SDL_GPUTexture *&bloom : slot.bloom_tex ) {
+            bloom = SDL_CreateGPUTexture( g_ctx.device, &ci );
+        }
+        if( !slot.bloom_tex[0] || !slot.bloom_tex[1] ) {
+            write_status( "Bloom ping-pong textures unavailable; Bloom disabled" );
         }
 
         SDL_PropertiesID props = SDL_CreateProperties();
@@ -1516,7 +1579,7 @@ bool probe( SDL_Renderer *renderer )
     vb_descs[1].pitch = INSTANCE_STRIDE;
     vb_descs[1].input_rate = SDL_GPU_VERTEXINPUTRATE_INSTANCE;
 
-    SDL_GPUVertexAttribute attrs[9] {};
+    SDL_GPUVertexAttribute attrs[10] {};
     attrs[0].location = 0;
     attrs[0].buffer_slot = 0;
     attrs[0].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3;
@@ -1553,6 +1616,10 @@ bool probe( SDL_Renderer *renderer )
     attrs[8].buffer_slot = 1;
     attrs[8].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT;
     attrs[8].offset = 15 * sizeof( float );
+    attrs[9].location = 9;
+    attrs[9].buffer_slot = 1;
+    attrs[9].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4;
+    attrs[9].offset = 16 * sizeof( float );
 
     SDL_GPUGraphicsPipelineCreateInfo pi{};
     pi.vertex_shader = vs;
@@ -1560,7 +1627,7 @@ bool probe( SDL_Renderer *renderer )
     pi.vertex_input_state.vertex_buffer_descriptions = vb_descs;
     pi.vertex_input_state.num_vertex_buffers = 2;
     pi.vertex_input_state.vertex_attributes = attrs;
-    pi.vertex_input_state.num_vertex_attributes = 9;
+    pi.vertex_input_state.num_vertex_attributes = 10;
     pi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
     pi.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
     // P0: no culling so a winding/y-flip mismatch can never blank the scene
@@ -1589,6 +1656,18 @@ bool probe( SDL_Renderer *renderer )
         write_status( "unavailable: pipeline creation failed: " + std::string( SDL_GetError() ) );
         g_ctx.teardown();
         return false;
+    }
+
+    SDL_GPUGraphicsPipelineCreateInfo mrtpi = pi;
+    const std::array<SDL_GPUColorTargetDescription, 2> mrt_colors = { color_desc, color_desc };
+    mrtpi.target_info.num_color_targets = 2;
+    mrtpi.target_info.color_target_descriptions = mrt_colors.data();
+    mrtpi.depth_stencil_state.enable_depth_write = true;
+    g_ctx.pipeline_mrt = SDL_CreateGPUGraphicsPipeline( device, &mrtpi );
+    mrtpi.depth_stencil_state.enable_depth_write = false;
+    g_ctx.pipeline_decal_mrt = SDL_CreateGPUGraphicsPipeline( device, &mrtpi );
+    if( !g_ctx.pipeline_mrt || !g_ctx.pipeline_decal_mrt ) {
+        write_status( "emissive MRT pipeline unavailable; Bloom disabled" );
     }
 
     SDL_GPUGraphicsPipelineCreateInfo dppi = pi;
@@ -1658,6 +1737,15 @@ bool probe( SDL_Renderer *renderer )
         if( !g_ctx.sky_pipeline ) {
             write_status( "sky pipeline creation failed: " + std::string( SDL_GetError() ) );
         }
+        const std::array<SDL_GPUColorTargetDescription, 2> sky_mrt_colors = {
+            scolor_desc, scolor_desc
+        };
+        spi.target_info.num_color_targets = 2;
+        spi.target_info.color_target_descriptions = sky_mrt_colors.data();
+        g_ctx.sky_mrt_pipeline = SDL_CreateGPUGraphicsPipeline( device, &spi );
+        if( !g_ctx.sky_mrt_pipeline ) {
+            write_status( "sky emissive MRT pipeline unavailable; Bloom disabled" );
+        }
     } else {
         write_status( "sky shaders missing; procedural sky disabled" );
     }
@@ -1673,6 +1761,12 @@ bool probe( SDL_Renderer *renderer )
     SDL_GPUShader *gtao_fs = load_shader( device, "gtao3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
     SDL_GPUShader *ao_blur_fs = load_shader( device, "gtao3d_blur.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 0,
                                  1 );
+    SDL_GPUShader *bloom_extract_fs = load_shader( device, "bloom3d_extract.frag",
+                                      SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 1 );
+    SDL_GPUShader *bloom_blur_fs = load_shader( device, "bloom3d_blur.frag",
+                                    SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
+    SDL_GPUShader *post_bloom_fs = load_shader( device, "tonemap3d_bloom.frag",
+                                   SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 2 );
     SDL_GPUGraphicsPipelineCreateInfo ppi{};
     ppi.vertex_shader = post_vs;
     ppi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
@@ -1696,6 +1790,21 @@ bool probe( SDL_Renderer *renderer )
         pcolor_desc.format = SDL_GPU_TEXTUREFORMAT_R16_FLOAT;
         g_ctx.ao_blur_pipeline = SDL_CreateGPUGraphicsPipeline( device, &ppi );
     }
+    if( post_vs && bloom_extract_fs ) {
+        ppi.fragment_shader = bloom_extract_fs;
+        pcolor_desc.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+        g_ctx.bloom_extract_pipeline = SDL_CreateGPUGraphicsPipeline( device, &ppi );
+    }
+    if( post_vs && bloom_blur_fs ) {
+        ppi.fragment_shader = bloom_blur_fs;
+        pcolor_desc.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+        g_ctx.bloom_blur_pipeline = SDL_CreateGPUGraphicsPipeline( device, &ppi );
+    }
+    if( post_vs && post_bloom_fs ) {
+        ppi.fragment_shader = post_bloom_fs;
+        pcolor_desc.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        g_ctx.post_bloom_pipeline = SDL_CreateGPUGraphicsPipeline( device, &ppi );
+    }
     if( post_vs ) {
         SDL_ReleaseGPUShader( device, post_vs );
     }
@@ -1708,6 +1817,15 @@ bool probe( SDL_Renderer *renderer )
     if( ao_blur_fs ) {
         SDL_ReleaseGPUShader( device, ao_blur_fs );
     }
+    if( bloom_extract_fs ) {
+        SDL_ReleaseGPUShader( device, bloom_extract_fs );
+    }
+    if( bloom_blur_fs ) {
+        SDL_ReleaseGPUShader( device, bloom_blur_fs );
+    }
+    if( post_bloom_fs ) {
+        SDL_ReleaseGPUShader( device, post_bloom_fs );
+    }
     if( !g_ctx.post_pipeline ) {
         write_status( "unavailable: HDR post pipeline creation failed" );
         g_ctx.teardown();
@@ -1715,6 +1833,10 @@ bool probe( SDL_Renderer *renderer )
     }
     if( !g_ctx.gtao_pipeline || !g_ctx.ao_blur_pipeline ) {
         write_status( "GTAO pipeline unavailable; ambient occlusion disabled" );
+    }
+    if( !g_ctx.bloom_extract_pipeline || !g_ctx.bloom_blur_pipeline ||
+        !g_ctx.post_bloom_pipeline ) {
+        write_status( "Bloom post pipeline unavailable; Bloom disabled" );
     }
 
     // Optional final-composite tilt-shift. Missing artifacts fall back to the
@@ -2467,6 +2589,21 @@ constexpr int CREATURE_HOSTILE_FLAG = 1 << 11;
 constexpr int CREATURE_NEUTRAL_FLAG = 1 << 12;
 constexpr int CREATURE_FRIENDLY_FLAG = 1 << 13;
 
+std::array<float, 4> emission_from_light( const float emitted,
+        const light_color_rgb &light_color = {} )
+{
+    if( emitted <= 0.0f ) {
+        return {};
+    }
+    const float gain = 3.0f * ( 1.0f - std::exp( -0.12f * emitted ) );
+    const bool has_color = light_color.r > 0.0f || light_color.g > 0.0f || light_color.b > 0.0f;
+    const light_color_rgb color = has_color
+                                  ? light_color : light_color_rgb{ 1.0f, 0.82f, 0.6f };
+    return { gain * std::clamp( color.r, 0.0f, 1.0f ),
+             gain * std::clamp( color.g, 0.0f, 1.0f ),
+             gain * std::clamp( color.b, 0.0f, 1.0f ), 1.0f };
+}
+
 void push_instance( instance_sink out, const float dx, const float dy,
                     const float z, const float sx, const float sy, const float sz,
                     const sprite_info &spr, const float r, const float g, const float b,
@@ -2474,7 +2611,8 @@ void push_instance( instance_sink out, const float dx, const float dy,
                     const bool side_strip = false, const float pad_value = -1.0f,
                     const bool ghost = false, const float saturation = 1.0f,
                     const bool memory = false, const bool soft_alpha = false,
-                    const bool edge_skirt = false, const int creature_relation = 0 )
+                    const bool edge_skirt = false, const int creature_relation = 0,
+                    const std::array<float, 4> &emission = {} )
 {
     out.data[0] = dx;
     out.data[1] = dy;
@@ -2514,6 +2652,10 @@ void push_instance( instance_sink out, const float dx, const float dy,
                    static_cast<float>( creature_relation );
     out.data[15] = pad_value >= 0.0f ? pad_value
                    : ( side_strip ? spr.v1 - 0.02f * ( spr.v1 - spr.v0 ) : 0.0f );
+    out.data[16] = emission[0];
+    out.data[17] = emission[1];
+    out.data[18] = emission[2];
+    out.data[19] = emission[3];
 }
 
 void mark_same_level_wall( std::vector<float> &out, const bool current_level )
@@ -2543,10 +2685,11 @@ int push_utility_shell( std::vector<float> &top_out, std::vector<float> &side_ou
                         const float dx, const float dy, const float wz,
                         const sprite_info &spr, const float r, const float g, const float b,
                         const int rota4, const bool ghost, const float saturation,
-                        const bool memory )
+                        const bool memory, const std::array<float, 4> &emission = {} )
 {
     push_instance( top_out, dx, dy, wz + FLAT_UTILITY_Z, 1.0f, 1.0f, 1.0f, spr,
-                   r, g, b, false, rota4, false, -1.0f, ghost, saturation, memory );
+                   r, g, b, false, rota4, false, -1.0f, ghost, saturation, memory,
+                   false, false, 0, emission );
     int emitted = 1;
     const float side_base = wz - 0.001f;
     const float side_height = FLAT_UTILITY_Z + 0.001f;
@@ -3917,6 +4060,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                 if( t == t_null ) {
                     continue;
                 }
+                const std::array<float, 4> terrain_emission = emission_from_light(
+                            t->light_emitted, t->light_color );
                 // A floor-blocked cell exposes only its wall face. The shared
                 // classifier and wall-specific light query must both pass;
                 // nothing else in this cell becomes visible through this path.
@@ -4145,7 +4290,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                         push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
                                        wz - 0.001f, 1.0f, 1.0f, 1.0f, ground_spr,
                                        gr, gg, gb, false, ground_rot4, false, -1.0f, ghost,
-                                       tone.sat );
+                                       tone.sat, false, false, false, 0, terrain_emission );
                         ++count;
                     } else {
                         sprite_info gspr = ground_spr;
@@ -4157,7 +4302,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                         push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
                                        wz - FLOOR_THICK - 0.001f, 1.0f, 1.0f, FLOOR_THICK, gspr,
                                        gr, gg, gb, true, ground_rot4, false, -1.0f, ghost,
-                                       tone.sat );
+                                       tone.sat, false, false, false, 0, terrain_emission );
                         ++count;
                     }
                 }
@@ -4171,7 +4316,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                         std::vector<float> &top = bucket_for( MODE_FLATQUAD, ftex ? fspr.atlas : nullptr );
                         std::vector<float> &sides = bucket_for( MODE_LINEQUAD, ftex ? fspr.atlas : nullptr );
                         count += push_utility_shell( top, sides, dx, dy, wz, fspr, or_, og, ob, frot4,
-                                                     ghost, tone.sat, false );
+                                                     ghost, tone.sat, false, terrain_emission );
                     }
                     continue;
                 }
@@ -4187,7 +4332,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                     std::vector<float> &v = bucket_for( MODE_FLATQUAD, fspr.atlas );
                     push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
                                    wz + 0.004f, 1.0f, 1.0f, 1.0f, fspr, or_, og, ob,
-                                   false, 0, false, -1.0f, ghost, tone.sat );
+                                   false, 0, false, -1.0f, ghost, tone.sat,
+                                   false, false, false, 0, terrain_emission );
                     ++count;
                 }
 
@@ -4228,7 +4374,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                     push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
                                    wz - TREE_HEIGHT * fspr.base_drop,
                                    1.0f, 1.0f, TREE_HEIGHT, fspr, or_, og, ob,
-                                   false, 0, false, -1.0f, ghost, tone.sat );
+                                   false, 0, false, -1.0f, ghost, tone.sat,
+                                   false, false, false, 0, terrain_emission );
                     ++count;
                 } else if( is_shrub && !roof_unseen ) {
                     // same crossed quads, but shrub-sized
@@ -4236,7 +4383,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                     push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
                                    wz - SHRUB_HEIGHT * fspr.base_drop,
                                    0.9f, 0.9f, SHRUB_HEIGHT, fspr, or_, og, ob,
-                                   false, 0, false, -1.0f, ghost, tone.sat );
+                                   false, 0, false, -1.0f, ghost, tone.sat,
+                                   false, false, false, 0, terrain_emission );
                     ++count;
                 } else if( is_panel ) {
                     // doors and windows are planar: a thin cutout panel standing in
@@ -4267,7 +4415,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                         constexpr float SILL_H = 0.85f;
                         if( !is_empty_frame ) {
                             push_instance( v, px, py, wz + SILL_H, psx, psy, SILL_H, facespr,
-                                           pr, pg, pb, false, 0, false, -1.0f, ghost, tone.sat );
+                                           pr, pg, pb, false, 0, false, -1.0f, ghost, tone.sat,
+                                           false, false, false, 0, terrain_emission );
                             mark_same_level_wall( v, dz == 0 );
                             ++count;
                         }
@@ -4309,7 +4458,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                         // door = grounded panel + a lintel voxel up to the wall top
                         if( !is_empty_frame ) {
                             push_instance( v, px, py, wz, psx, psy, PANEL_HEIGHT, facespr,
-                                           pr, pg, pb, false, 0, false, -1.0f, ghost, tone.sat );
+                                           pr, pg, pb, false, 0, false, -1.0f, ghost, tone.sat,
+                                           false, false, false, 0, terrain_emission );
                             mark_same_level_wall( v, dz == 0 );
                             ++count;
                         }
@@ -4346,13 +4496,14 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                     std::vector<float> &v = bucket_for( MODE_BILLBOARD_SNAP, ftex ? fspr.atlas : nullptr );
                     push_instance( v, dx + 0.5f, dy + 0.5f, wz - FENCE_HEIGHT * fspr.base_drop,
                                    1.0f, FENCE_HEIGHT, 1.0f, fspr, or_, og, ob,
-                                   false, 0, false, -1.0f, ghost, tone.sat );
+                                   false, 0, false, -1.0f, ghost, tone.sat,
+                                   false, false, false, 0, terrain_emission );
                     ++count;
                 } else if( is_flat_utility ) {
                     std::vector<float> &top = bucket_for( MODE_FLATQUAD, ftex ? fspr.atlas : nullptr );
                     std::vector<float> &sides = bucket_for( MODE_LINEQUAD, ftex ? fspr.atlas : nullptr );
                     count += push_utility_shell( top, sides, dx, dy, wz, fspr, or_, og, ob, frot4,
-                                                 ghost, tone.sat, false );
+                                                 ghost, tone.sat, false, terrain_emission );
                 } else if( is_fence ) {
                     // fences are flat vertical quads standing on the fence line — a
                     // box would smear the sprite's transparent margins over its end
@@ -4374,7 +4525,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                     if( straight || ( !cn && !cs && !ce && !cw ) ) {
                         push_instance( v, dx + 0.5f, dy + 0.5f, wz, 1.0f, fh, 1.0f,
                                        fspr, or_, og, ob, false, 0, false, ew_line ? 0.0f : 1.0f,
-                                       ghost, tone.sat );
+                                       ghost, tone.sat, false, false, false, 0, terrain_emission );
                         mark_same_level_wall( v, dz == 0 );
                         ++count;
                     } else {
@@ -4386,25 +4537,29 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                         const float fcy = dy + 0.5f;
                         if( cn ) {
                             push_instance( v, fcx, fcy - 0.25f, wz, 0.5f, fh, 1.0f, hspr,
-                                           or_, og, ob, false, 0, false, 1.0f, ghost, tone.sat );
+                                           or_, og, ob, false, 0, false, 1.0f, ghost, tone.sat,
+                                           false, false, false, 0, terrain_emission );
                             mark_same_level_wall( v, dz == 0 );
                             ++count;
                         }
                         if( cs ) {
                             push_instance( v, fcx, fcy + 0.25f, wz, 0.5f, fh, 1.0f, hspr,
-                                           or_, og, ob, false, 0, false, 1.0f, ghost, tone.sat );
+                                           or_, og, ob, false, 0, false, 1.0f, ghost, tone.sat,
+                                           false, false, false, 0, terrain_emission );
                             mark_same_level_wall( v, dz == 0 );
                             ++count;
                         }
                         if( ce ) {
                             push_instance( v, fcx + 0.25f, fcy, wz, 0.5f, fh, 1.0f, hspr,
-                                           or_, og, ob, false, 0, false, 0.0f, ghost, tone.sat );
+                                           or_, og, ob, false, 0, false, 0.0f, ghost, tone.sat,
+                                           false, false, false, 0, terrain_emission );
                             mark_same_level_wall( v, dz == 0 );
                             ++count;
                         }
                         if( cw ) {
                             push_instance( v, fcx - 0.25f, fcy, wz, 0.5f, fh, 1.0f, hspr,
-                                           or_, og, ob, false, 0, false, 0.0f, ghost, tone.sat );
+                                           or_, og, ob, false, 0, false, 0.0f, ghost, tone.sat,
+                                           false, false, false, 0, terrain_emission );
                             mark_same_level_wall( v, dz == 0 );
                             ++count;
                         }
@@ -4414,7 +4569,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                     std::vector<float> &v = bucket_for( MODE_BOX, ftex ? fspr.atlas : nullptr );
                     push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ), wz,
                                    1.0f, 1.0f, WALL_HEIGHT, fspr, or_, og, ob,
-                                   false, 0, false, -1.0f, ghost, tone.sat );
+                                   false, 0, false, -1.0f, ghost, tone.sat,
+                                   false, false, false, 0, terrain_emission );
                     mark_same_level_wall( v, dz == 0 );
                     ++count;
                 }
@@ -4495,6 +4651,10 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                 break;
                             }
                             const int intensity = fd_pr.second.get_field_intensity();
+                            const field_intensity_level &light_level =
+                                fd_pr.second.get_intensity_level();
+                            const std::array<float, 4> field_emission = emission_from_light(
+                                        light_level.light_emitted, light_level.light_color );
                             const std::array<int, 4> nb = {{
                                     neighbor_same_field( fid, p + point::south ),
                                     neighbor_same_field( fid, p + point::east ),
@@ -4567,7 +4727,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                                static_cast<float>( dy ) + 0.5f - fwd_y * off,
                                                wz + 0.01f, w, FIELD_RISER_HEIGHT, 1.0f, s,
                                                fr, fgn, fb, false, 0, false, -1.0f, ghost,
-                                               tone.sat, false, spr != nullptr );
+                                               tone.sat, false, spr != nullptr, false, 0,
+                                               field_emission );
                                 ++count;
                             } else {
                                 // thin ground decal; later fields (map order)
@@ -4583,7 +4744,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                                FIELD_DECAL_STAGGER * ( ordinal % 8 ),
                                                sx, sy, 1.0f, s, fr, fgn, fb,
                                                false, 0, false, -1.0f, ghost, tone.sat,
-                                               false, spr != nullptr );
+                                               false, spr != nullptr, false, 0, field_emission );
                                 ++count;
                             }
                             ++ordinal;
@@ -4592,6 +4753,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                 }
 
                 if( !roof_unseen && f != furn_str_id::NULL_ID() && count < MAX_DRAW_INSTANCES ) {
+                    const std::array<float, 4> furniture_emission = emission_from_light(
+                                f->light_emitted, f->light_color );
                     sprite_lookup_3d fl;
                     lookup_sprite_layers_3d( tiles, f->id.str(), TILE_CATEGORY::FURNITURE, p,
                                              -1, 0, true, fl );
@@ -4619,14 +4782,16 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                                             ftex ? fspr.atlas : nullptr );
                         push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
                                        wz + 0.004f, 1.0f, 1.0f, 1.0f, fspr, fr, fg, fb,
-                                       false, fl.fg_rot4, false, -1.0f, ghost, tone.sat );
+                                       false, fl.fg_rot4, false, -1.0f, ghost, tone.sat,
+                                       false, false, false, 0, furniture_emission );
                     } else {
                         std::vector<float> &v = bucket_for( MODE_BILLBOARD_SNAP,
                                                             ftex ? fspr.atlas : nullptr );
                         push_instance( v, dx + 0.5f, dy + 0.5f,
                                        wz - FURN_QUAD_HEIGHT * fspr.base_drop,
                                        fw, FURN_QUAD_HEIGHT, 1.0f, fspr, fr, fg, fb,
-                                       false, 0, false, -1.0f, ghost, tone.sat );
+                                       false, 0, false, -1.0f, ghost, tone.sat,
+                                       false, false, false, 0, furniture_emission );
                     }
                     ++count;
                     if( !flat && layered && fl.fg_tex && count < MAX_DRAW_INSTANCES ) {
@@ -4701,8 +4866,15 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                             ++count;
                         }
                         std::vector<float> &v = bucket_for( MODE_BILLBOARD, itex ? ispr.atlas : nullptr );
+                        float item_luminance = 0.0f;
+                        units::angle item_light_width = 0_degrees;
+                        units::angle item_light_direction = 0_degrees;
+                        const std::array<float, 4> item_emission =
+                            itm.getlight( item_luminance, item_light_width, item_light_direction )
+                            ? emission_from_light( item_luminance ) : std::array<float, 4> {};
                         push_instance( v, cx, cy, iz, iw, ITEM_HEIGHT, 1.0f, ispr,
-                                       ir, ig, ib, false, 0, false, -1.0f, ghost, tone.sat );
+                                       ir, ig, ib, false, 0, false, -1.0f, ghost, tone.sat,
+                                       false, false, false, 0, item_emission );
                         ++count;
                     }
                 }
@@ -4731,6 +4903,24 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                         // live inside it
                         const vpart_display vd = veh.get_display_of_tile( mount );
                         if( !vd.id.is_null() ) {
+                            std::array<float, 4> vehicle_emission{};
+                            const bool odd_turn = calendar::once_every( 2_turns );
+                            for( const int pi : veh.parts_at_relative( mount, true, false ) ) {
+                                const vehicle_part &part = veh.part( pi );
+                                if( !part.enabled || !part.is_available() || !part.is_light() ) {
+                                    continue;
+                                }
+                                const vpart_info &info = part.info();
+                                if( info.has_flag( VPFLAG_CIRCLE_LIGHT ) &&
+                                    ( ( odd_turn && !info.has_flag( VPFLAG_ODDTURN ) &&
+                                        info.has_flag( VPFLAG_EVENTURN ) ) ||
+                                      ( !odd_turn && !info.has_flag( VPFLAG_EVENTURN ) &&
+                                        info.has_flag( VPFLAG_ODDTURN ) ) ) ) {
+                                    continue;
+                                }
+                                vehicle_emission = emission_from_light( info.bonus, info.light_color );
+                                break;
+                            }
                             const int vsub = vd.is_open ? open_ : vd.is_broken ? broken : 0;
                             const int vrota = angle_to_dir4( veh.face.dir() - 270_degrees );
                             sprite_lookup_3d vl;
@@ -4861,11 +5051,12 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                                          const float ddy, const float dz,
                                                          const float sx, const float sy,
                                                          const sprite_info & dspr, const float dr, const float dg,
-                            const float db, const int drot4 ) {
+                            const float db, const int drot4, const std::array<float, 4> &demission = {} ) {
                                 decal_instance di;
                                 di.atlas = datlas;
                                 push_instance( di.f, ddx, ddy, dz, sx, sy, 1.0f, dspr, dr, dg, db,
-                                               false, drot4, false, -1.0f, ghost, tone.sat );
+                                               false, drot4, false, -1.0f, ghost, tone.sat,
+                                               false, false, false, 0, demission );
                                 decals.push_back( di );
                                 ++count;
                             };
@@ -4873,7 +5064,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                 push_decal( vspr.atlas, static_cast<float>( dx ) + ox,
                                             static_cast<float>( dy ) + oy, wz + VEH_DECAL_Z,
                                             vspr.px_w / 32.0f, vspr.px_h / 32.0f, vspr,
-                                            tone.shade, tone.shade, tone.shade, rot4 );
+                                            tone.shade, tone.shade, tone.shade, rot4,
+                                            vehicle_emission );
                             };
                             // upright panel on a tile's edge plane whose outward
                             // normal is the world delta d. swap_u mirrors the
@@ -4977,7 +5169,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                 push_instance( di.f, pcx, pcy, base_z, plen, ph, 1.0f, uspr,
                                                tone.shade, tone.shade, tone.shade,
                                                false, 0, false, run_ns ? 1.0f : 0.0f,
-                                               ghost, tone.sat );
+                                               ghost, tone.sat, false, false, false, 0,
+                                               vehicle_emission );
                                 di.sort_key = pcx * fwd_x + pcy * fwd_y;
                                 panels.push_back( di );
                                 ++count;
@@ -5027,7 +5220,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                                         static_cast<float>( dy ), wz + VEH_DECAL_Z,
                                                         1.0f, 1.0f, vspr,
                                                         vc.x * tone.shade, vc.y * tone.shade,
-                                                        vc.z * tone.shade, 0 );
+                                                        vc.z * tone.shade, 0, vehicle_emission );
                                         }
                                         vdrew = true;
                                     }
@@ -5322,7 +5515,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                                 static_cast<float>( dy ),
                                                 wz + box_top + 0.005f,
                                                 1.0f, 1.0f, crop_spill( vl.bg, vl.offset ),
-                                                tone.shade, tone.shade, tone.shade, 0 );
+                                                tone.shade, tone.shade, tone.shade, 0,
+                                                vehicle_emission );
                                 }
                                 if( vl.fg_tex ) {
                                     push_decal( vl.fg.atlas, static_cast<float>( dx ),
@@ -5330,7 +5524,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                                 wz + box_top + 0.005f,
                                                 1.0f, 1.0f, crop_spill( vl.fg, vl.offset ),
                                                 tone.shade, tone.shade, tone.shade,
-                                                vl.fg_rot4 );
+                                                vl.fg_rot4, vehicle_emission );
                                 }
                             }
                             // wing mirror (TP-26): a protrusion mounted
@@ -5407,7 +5601,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                                1.0f, 1.0f, box_top - VEH_PANEL_BASE_Z - 0.30f, rspr,
                                                0.6f * tone.shade, 0.6f * tone.shade,
                                                0.6f * tone.shade,
-                                               false, 0, false, -1.0f, ghost, tone.sat );
+                                               false, 0, false, -1.0f, ghost, tone.sat,
+                                               false, false, false, 0, vehicle_emission );
                                 ++count;
                             }
                             // roof-mounted equipment (TP-16): police lights,
@@ -5443,7 +5638,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                                 wz + VEH_ROOF_Z + 0.005f,
                                                 vl.bg.px_w / 32.0f, vl.bg.px_h / 32.0f,
                                                 vl.bg,
-                                                tone.shade, tone.shade, tone.shade, 0 );
+                                                tone.shade, tone.shade, tone.shade, 0,
+                                                vehicle_emission );
                                 }
                                 if( vl.fg_tex && count < MAX_DRAW_INSTANCES ) {
                                     push_decal( vl.fg.atlas, static_cast<float>( dx ) + ox,
@@ -5452,7 +5648,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                                 vl.fg.px_w / 32.0f, vl.fg.px_h / 32.0f,
                                                 vl.fg,
                                                 tone.shade, tone.shade, tone.shade,
-                                                vl.fg_rot4 );
+                                                vl.fg_rot4, vehicle_emission );
                                 }
                             }
                             if( vdrew && vd.has_cargo && count < MAX_DRAW_INSTANCES ) {
@@ -6689,6 +6885,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> effect_params;
         mat4 light_vp;
         std::array<float, 4> shadow_params;
+        std::array<float, 4> shadow_pcss;
         std::array<float, 4> light_params;
         std::array<float, 4> light_origin;
         std::array<float, 4> atmosphere_sun;
@@ -6697,7 +6894,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> atmosphere_origin;
         std::array<float, 4> ao_params;
     };
-    static_assert( sizeof( frag_uniforms ) == 23 * 16, "terrain3d fragment UBO must match std140" );
+    static_assert( sizeof( frag_uniforms ) == 24 * 16, "terrain3d fragment UBO must match std140" );
     frag_uniforms frag_ub{};
     const tripoint_bub_ms upos = get_avatar().pos_bub();
     const float player_gz = ( upos.z() - center.z() ) * LEVEL_HEIGHT;
@@ -6737,6 +6934,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     frag_ub.effect_params = { 0.075f, 0.10f, 1.0f / WALL_HEIGHT, 0.0f };
     frag_ub.light_vp = light_vp;
     frag_ub.shadow_params = { 0.0f, 1.0f / SHADOW_MAP_SIZE, 0.00035f, 0.0f };
+    frag_ub.shadow_pcss = { 2.0f * shadow_extent, 180.0f - 0.5f, 0.0093f, 8.0f };
     frag_ub.light_params = { 0.0f, static_cast<float>( MAPSIZE_Y ),
                              static_cast<float>( center.z() + OVERMAP_DEPTH ), LEVEL_HEIGHT
                            };
@@ -6806,6 +7004,12 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
                           g_ctx.prepass_pipeline && g_ctx.gtao_pipeline &&
                           g_ctx.ao_blur_pipeline && g_ctx.linear_sampler;
     frag_ub.ao_params[0] = ao_ready ? 1.0f : 0.0f;
+    const bool bloom_ready = !nv_tint_active() && slot.emissive_tex &&
+                             slot.bloom_tex[0] && slot.bloom_tex[1] &&
+                             g_ctx.pipeline_mrt && g_ctx.pipeline_decal_mrt &&
+                             ( !g_ctx.sky_pipeline || g_ctx.sky_mrt_pipeline ) &&
+                             g_ctx.bloom_extract_pipeline && g_ctx.bloom_blur_pipeline &&
+                             g_ctx.post_bloom_pipeline && g_ctx.linear_sampler;
 
     // upload instance data. A fully culled scene still renders the sky/clear,
     // but must not create a zero-sized transfer buffer or upload.
@@ -7026,25 +7230,34 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     color_target.load_op = SDL_GPU_LOADOP_CLEAR;
     color_target.store_op = SDL_GPU_STOREOP_STORE;
     color_target.clear_color = sky;
+    SDL_GPUColorTargetInfo emissive_target{};
+    emissive_target.texture = slot.emissive_tex;
+    emissive_target.load_op = SDL_GPU_LOADOP_CLEAR;
+    emissive_target.store_op = SDL_GPU_STOREOP_STORE;
+    emissive_target.clear_color = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const SDL_GPUColorTargetInfo world_targets[2] = { color_target, emissive_target };
     SDL_GPUDepthStencilTargetInfo depth_target{};
     depth_target.texture = slot.depth_tex;
     depth_target.load_op = ao_ready ? SDL_GPU_LOADOP_LOAD : SDL_GPU_LOADOP_CLEAR;
     depth_target.store_op = g_ctx.sky_pipeline ? SDL_GPU_STOREOP_STORE : SDL_GPU_STOREOP_DONT_CARE;
     depth_target.clear_depth = 1.0f;
 
-    SDL_GPURenderPass *pass = SDL_BeginGPURenderPass( cmd, &color_target, 1, &depth_target );
-    SDL_BindGPUGraphicsPipeline( pass, g_ctx.pipeline );
+    SDL_GPURenderPass *pass = SDL_BeginGPURenderPass( cmd, world_targets,
+                                bloom_ready ? 2 : 1, &depth_target );
+    SDL_BindGPUGraphicsPipeline( pass, bloom_ready ? g_ctx.pipeline_mrt : g_ctx.pipeline );
     SDL_GPUBufferBinding inst_bind{};
     inst_bind.buffer = slot.instance_vb;
     inst_bind.offset = 0;
-    SDL_GPUGraphicsPipeline *bound_pipeline = g_ctx.pipeline;
+    SDL_GPUGraphicsPipeline *bound_pipeline = bloom_ready ? g_ctx.pipeline_mrt : g_ctx.pipeline;
     for( const draw_segment &seg : segments ) {
         // decals draw with the depth-write-off pipeline: painter's order
         // (instance order = 2D's row order) resolves decal-vs-decal overlaps,
         // so coplanar vehicle part sprites can never z-fight
         const bool decal_seg = seg.mode == MODE_FLATQUAD_DECAL ||
                                seg.mode == MODE_LINEQUAD_DECAL;
-        SDL_GPUGraphicsPipeline *want = decal_seg ? g_ctx.pipeline_decal : g_ctx.pipeline;
+        SDL_GPUGraphicsPipeline *want = decal_seg
+                                        ? ( bloom_ready ? g_ctx.pipeline_decal_mrt : g_ctx.pipeline_decal )
+                                        : ( bloom_ready ? g_ctx.pipeline_mrt : g_ctx.pipeline );
         if( want != bound_pipeline ) {
             SDL_BindGPUGraphicsPipeline( pass, want );
             bound_pipeline = want;
@@ -7103,15 +7316,67 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         sky_target.texture = slot.hdr_tex;
         sky_target.load_op = SDL_GPU_LOADOP_LOAD;
         sky_target.store_op = SDL_GPU_STOREOP_STORE;
+        SDL_GPUColorTargetInfo sky_emissive_target{};
+        sky_emissive_target.texture = slot.emissive_tex;
+        sky_emissive_target.load_op = SDL_GPU_LOADOP_LOAD;
+        sky_emissive_target.store_op = SDL_GPU_STOREOP_STORE;
+        const SDL_GPUColorTargetInfo sky_targets[2] = { sky_target, sky_emissive_target };
         SDL_GPUDepthStencilTargetInfo sky_depth{};
         sky_depth.texture = slot.depth_tex;
         sky_depth.load_op = SDL_GPU_LOADOP_LOAD;
         sky_depth.store_op = SDL_GPU_STOREOP_DONT_CARE;
-        SDL_GPURenderPass *sky_pass = SDL_BeginGPURenderPass( cmd, &sky_target, 1, &sky_depth );
-        SDL_BindGPUGraphicsPipeline( sky_pass, g_ctx.sky_pipeline );
+        SDL_GPURenderPass *sky_pass = SDL_BeginGPURenderPass( cmd, sky_targets,
+                                      bloom_ready ? 2 : 1, &sky_depth );
+        SDL_BindGPUGraphicsPipeline( sky_pass,
+                                     bloom_ready ? g_ctx.sky_mrt_pipeline : g_ctx.sky_pipeline );
         SDL_PushGPUFragmentUniformData( cmd, 0, &sky_ub, sizeof( sky_ub ) );
         SDL_DrawGPUPrimitives( sky_pass, 3, 1, 0, 0 );
         SDL_EndGPURenderPass( sky_pass );
+    }
+
+    int bloom_source = 0;
+    if( bloom_ready ) {
+        SDL_GPUColorTargetInfo extract_target{};
+        extract_target.texture = slot.bloom_tex[0];
+        extract_target.load_op = SDL_GPU_LOADOP_CLEAR;
+        extract_target.store_op = SDL_GPU_STOREOP_STORE;
+        extract_target.clear_color = { 0.0f, 0.0f, 0.0f, 1.0f };
+        SDL_GPURenderPass *extract_pass = SDL_BeginGPURenderPass( cmd, &extract_target, 1, nullptr );
+        SDL_BindGPUGraphicsPipeline( extract_pass, g_ctx.bloom_extract_pipeline );
+        SDL_GPUTextureSamplerBinding emissive_sampler{};
+        emissive_sampler.texture = slot.emissive_tex;
+        emissive_sampler.sampler = g_ctx.linear_sampler;
+        SDL_BindGPUFragmentSamplers( extract_pass, 0, &emissive_sampler, 1 );
+        SDL_DrawGPUPrimitives( extract_pass, 3, 1, 0, 0 );
+        SDL_EndGPURenderPass( extract_pass );
+
+        const float bloom_w = static_cast<float>( ( w + 1 ) / 2 );
+        const float bloom_h = static_cast<float>( ( h + 1 ) / 2 );
+        for( int round = 0; round < 2; ++round ) {
+            for( int axis = 0; axis < 2; ++axis ) {
+                const int bloom_target = 1 - bloom_source;
+                SDL_GPUColorTargetInfo blur_target{};
+                blur_target.texture = slot.bloom_tex[bloom_target];
+                blur_target.load_op = SDL_GPU_LOADOP_CLEAR;
+                blur_target.store_op = SDL_GPU_STOREOP_STORE;
+                blur_target.clear_color = { 0.0f, 0.0f, 0.0f, 1.0f };
+                SDL_GPURenderPass *blur_pass = SDL_BeginGPURenderPass( cmd, &blur_target, 1, nullptr );
+                SDL_BindGPUGraphicsPipeline( blur_pass, g_ctx.bloom_blur_pipeline );
+                SDL_GPUTextureSamplerBinding blur_sampler{};
+                blur_sampler.texture = slot.bloom_tex[bloom_source];
+                blur_sampler.sampler = g_ctx.linear_sampler;
+                SDL_BindGPUFragmentSamplers( blur_pass, 0, &blur_sampler, 1 );
+                const std::array<float, 4> blur_params = {
+                    axis == 0 ? 1.0f / bloom_w : 0.0f,
+                    axis == 1 ? 1.0f / bloom_h : 0.0f,
+                    round == 0 ? 1.0f : 2.0f, 0.0f
+                };
+                SDL_PushGPUFragmentUniformData( cmd, 0, blur_params.data(), sizeof( blur_params ) );
+                SDL_DrawGPUPrimitives( blur_pass, 3, 1, 0, 0 );
+                SDL_EndGPURenderPass( blur_pass );
+                bloom_source = bloom_target;
+            }
+        }
     }
 
     SDL_GPUColorTargetInfo post_target{};
@@ -7120,11 +7385,14 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     post_target.store_op = SDL_GPU_STOREOP_STORE;
     post_target.clear_color = { 0.0f, 0.0f, 0.0f, 1.0f };
     SDL_GPURenderPass *post_pass = SDL_BeginGPURenderPass( cmd, &post_target, 1, nullptr );
-    SDL_BindGPUGraphicsPipeline( post_pass, g_ctx.post_pipeline );
-    SDL_GPUTextureSamplerBinding post_sampler{};
-    post_sampler.texture = slot.hdr_tex;
-    post_sampler.sampler = g_ctx.sampler;
-    SDL_BindGPUFragmentSamplers( post_pass, 0, &post_sampler, 1 );
+    SDL_BindGPUGraphicsPipeline( post_pass,
+                                 bloom_ready ? g_ctx.post_bloom_pipeline : g_ctx.post_pipeline );
+    SDL_GPUTextureSamplerBinding post_samplers[2]{};
+    post_samplers[0].texture = slot.hdr_tex;
+    post_samplers[0].sampler = g_ctx.sampler;
+    post_samplers[1].texture = slot.bloom_tex[bloom_source];
+    post_samplers[1].sampler = g_ctx.linear_sampler;
+    SDL_BindGPUFragmentSamplers( post_pass, 0, post_samplers, bloom_ready ? 2 : 1 );
     SDL_DrawGPUPrimitives( post_pass, 3, 1, 0, 0 );
     SDL_EndGPURenderPass( post_pass );
 

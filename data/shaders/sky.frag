@@ -25,6 +25,7 @@ layout(set = 3, binding = 0) uniform SkyUBO {
 
 layout(location = 0) in vec2 v_ndc;
 layout(location = 0) out vec4 out_color;
+layout(location = 1) out vec4 out_emissive;
 
 void main()
 {
@@ -47,12 +48,14 @@ void main()
 
     // sun disc + halo (hidden below the horizon or at night)
     vec3 sd = sun_dir.xyz;
+    vec3 sun_emission = vec3( 0.0 );
     if( sd.z > -0.05 && daylight > 0.01 ) {
         float d = dot( ray, normalize( sd ) );
         float disc = smoothstep( 0.9994, 0.9998, d );
         float halo = pow( max( d, 0.0 ), 64.0 ) * 0.25;
-        col += ( vec3( 1.0, 0.95, 0.8 ) * disc + vec3( 1.0, 0.9, 0.7 ) * halo )
-               * daylight * ( 1.0 - params.z * 0.6 );
+        sun_emission = ( vec3( 4.0, 3.8, 3.2 ) * disc + vec3( 1.0, 0.9, 0.7 ) * halo )
+                       * daylight * ( 1.0 - params.z * 0.6 );
+        col += sun_emission;
     }
 
     // clouds: intersect the ray with the same world-locked plane used for
@@ -69,7 +72,9 @@ void main()
         // a second noise sample shades the cloud body so it reads as puffy,
         // not a flat sticker
         cloud_col *= 0.6 + 0.5 * atmosphere_fbm( cpos * 1.7 + 3.1 );
-        col = mix( col, cloud_col, min( cov * 1.15, 0.95 ) );
+        float cloud_mix = min( cov * 1.15, 0.95 );
+        col = mix( col, cloud_col, cloud_mix );
+        sun_emission *= 1.0 - cloud_mix;
     }
 
     // night vision goggles: the whole viewport turns green like 2D's map.
@@ -78,6 +83,8 @@ void main()
     if( params.w > 0.5 ) {
         col = mix( nightvision_rgb( col ), overexposed_rgb( col ),
                    smoothstep( 0.85, 1.0, daylight ) );
+        sun_emission = vec3( 0.0 );
     }
     out_color = vec4( col, 1.0 );
+    out_emissive = vec4( sun_emission, 1.0 );
 }
