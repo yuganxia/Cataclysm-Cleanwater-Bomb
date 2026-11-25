@@ -633,6 +633,8 @@ struct frame_slot {
     SDL_GPUTexture *color_tex = nullptr;
     SDL_GPUTexture *hdr_tex = nullptr;
     SDL_GPUTexture *depth_tex = nullptr;
+    SDL_GPUTexture *ao_raw_tex = nullptr;
+    SDL_GPUTexture *ao_tex = nullptr;
     SDL_GPUTexture *shadow_tex = nullptr;
     SDL_GPUTexture *light_tex = nullptr;
     SDL_Texture *color_tex_sdl = nullptr;
@@ -657,6 +659,9 @@ struct context {
     SDL_GPUGraphicsPipeline *pipeline_decal = nullptr;
     SDL_GPUGraphicsPipeline *shadow_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *post_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline *prepass_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline *gtao_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline *ao_blur_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *sky_pipeline = nullptr; // far-depth background pass after the world
     cata_shader::shader tilt_shift_shader;
     cata_shader::render_state tilt_shift_state;
@@ -666,6 +671,7 @@ struct context {
     SDL_GPUBuffer *flatquad_vb = nullptr;
     SDL_GPUSampler *sampler = nullptr;
     SDL_GPUSampler *shadow_sampler = nullptr;
+    SDL_GPUSampler *linear_sampler = nullptr;
     SDL_GPUTexture *fallback_tex = nullptr; // 1x1 white, bound when a batch has no atlas
     std::array<frame_slot, FRAME_SLOT_COUNT> slots;
     int latest_ready = -1;
@@ -1030,6 +1036,14 @@ void context::teardown()
                 SDL_ReleaseGPUTexture( device, slot.depth_tex );
                 slot.depth_tex = nullptr;
             }
+            if( slot.ao_raw_tex ) {
+                SDL_ReleaseGPUTexture( device, slot.ao_raw_tex );
+                slot.ao_raw_tex = nullptr;
+            }
+            if( slot.ao_tex ) {
+                SDL_ReleaseGPUTexture( device, slot.ao_tex );
+                slot.ao_tex = nullptr;
+            }
             if( slot.shadow_tex ) {
                 SDL_ReleaseGPUTexture( device, slot.shadow_tex );
                 slot.shadow_tex = nullptr;
@@ -1074,6 +1088,10 @@ void context::teardown()
             SDL_ReleaseGPUSampler( device, shadow_sampler );
             shadow_sampler = nullptr;
         }
+        if( linear_sampler ) {
+            SDL_ReleaseGPUSampler( device, linear_sampler );
+            linear_sampler = nullptr;
+        }
         if( cube_vb ) {
             SDL_ReleaseGPUBuffer( device, cube_vb );
             cube_vb = nullptr;
@@ -1105,6 +1123,18 @@ void context::teardown()
         if( post_pipeline ) {
             SDL_ReleaseGPUGraphicsPipeline( device, post_pipeline );
             post_pipeline = nullptr;
+        }
+        if( prepass_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, prepass_pipeline );
+            prepass_pipeline = nullptr;
+        }
+        if( gtao_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, gtao_pipeline );
+            gtao_pipeline = nullptr;
+        }
+        if( ao_blur_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, ao_blur_pipeline );
+            ao_blur_pipeline = nullptr;
         }
         if( sky_pipeline ) {
             SDL_ReleaseGPUGraphicsPipeline( device, sky_pipeline );
@@ -1150,6 +1180,14 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
             SDL_ReleaseGPUTexture( g_ctx.device, slot.depth_tex );
             slot.depth_tex = nullptr;
         }
+        if( slot.ao_raw_tex ) {
+            SDL_ReleaseGPUTexture( g_ctx.device, slot.ao_raw_tex );
+            slot.ao_raw_tex = nullptr;
+        }
+        if( slot.ao_tex ) {
+            SDL_ReleaseGPUTexture( g_ctx.device, slot.ao_tex );
+            slot.ao_tex = nullptr;
+        }
         if( slot.shadow_tex ) {
             SDL_ReleaseGPUTexture( g_ctx.device, slot.shadow_tex );
             slot.shadow_tex = nullptr;
@@ -1191,7 +1229,7 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
         }
 
         ci.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
-        ci.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
+        ci.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
         slot.depth_tex = SDL_CreateGPUTexture( g_ctx.device, &ci );
         if( !slot.depth_tex ) {
             write_status( "ensure_targets failed: depth target: " + std::string( SDL_GetError() ) );
@@ -1221,6 +1259,17 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
         }
         slot.light_generations.fill( std::numeric_limits<uint64_t>::max() );
         slot.light_tint = true;
+
+        ci.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        ci.width = static_cast<Uint32>( ( w + 1 ) / 2 );
+        ci.height = static_cast<Uint32>( ( h + 1 ) / 2 );
+        ci.format = SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT;
+        slot.ao_raw_tex = SDL_CreateGPUTexture( g_ctx.device, &ci );
+        ci.format = SDL_GPU_TEXTUREFORMAT_R16_FLOAT;
+        slot.ao_tex = SDL_CreateGPUTexture( g_ctx.device, &ci );
+        if( !slot.ao_raw_tex || !slot.ao_tex ) {
+            write_status( "GTAO textures unavailable; ambient occlusion disabled" );
+        }
 
         SDL_PropertiesID props = SDL_CreateProperties();
         SDL_SetPointerProperty( props, SDL_PROP_TEXTURE_CREATE_GPU_TEXTURE_POINTER, slot.color_tex );
@@ -1446,7 +1495,7 @@ bool probe( SDL_Renderer *renderer )
     g_ctx.device = device;
 
     SDL_GPUShader *vs = load_shader( device, "terrain3d.vert", SDL_GPU_SHADERSTAGE_VERTEX, 1 );
-    SDL_GPUShader *fs = load_shader( device, "terrain3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 3 );
+    SDL_GPUShader *fs = load_shader( device, "terrain3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 4 );
     if( !vs || !fs ) {
         if( vs ) {
             SDL_ReleaseGPUShader( device, vs );
@@ -1518,7 +1567,7 @@ bool probe( SDL_Renderer *renderer )
     pi.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
     pi.depth_stencil_state.enable_depth_test = true;
     pi.depth_stencil_state.enable_depth_write = true;
-    pi.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_LESS;
+    pi.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
     pi.target_info.num_color_targets = 1;
     SDL_GPUColorTargetDescription color_desc{};
     color_desc.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
@@ -1533,14 +1582,26 @@ bool probe( SDL_Renderer *renderer )
     // draw order — painter's algorithm, exactly what 2D does
     pi.depth_stencil_state.enable_depth_write = false;
     g_ctx.pipeline_decal = SDL_CreateGPUGraphicsPipeline( device, &pi );
-    SDL_ReleaseGPUShader( device, vs );
-    SDL_ReleaseGPUShader( device, fs );
     if( !g_ctx.pipeline || !g_ctx.pipeline_decal ) {
+        SDL_ReleaseGPUShader( device, vs );
+        SDL_ReleaseGPUShader( device, fs );
         DebugLog( D_ERROR, DC_ALL ) << "render3d: pipeline creation failed: " << SDL_GetError();
         write_status( "unavailable: pipeline creation failed: " + std::string( SDL_GetError() ) );
         g_ctx.teardown();
         return false;
     }
+
+    SDL_GPUGraphicsPipelineCreateInfo dppi = pi;
+    dppi.depth_stencil_state.enable_depth_write = true;
+    dppi.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_LESS;
+    dppi.target_info.num_color_targets = 0;
+    dppi.target_info.color_target_descriptions = nullptr;
+    g_ctx.prepass_pipeline = SDL_CreateGPUGraphicsPipeline( device, &dppi );
+    if( !g_ctx.prepass_pipeline ) {
+        write_status( "depth prepass unavailable; GTAO disabled" );
+    }
+    SDL_ReleaseGPUShader( device, vs );
+    SDL_ReleaseGPUShader( device, fs );
 
     SDL_GPUShader *shadow_vs = load_shader( device, "terrain3d.vert", SDL_GPU_SHADERSTAGE_VERTEX, 1 );
     SDL_GPUShader *shadow_fs = load_shader( device, "terrain3d_shadow.frag",
@@ -1609,18 +1670,31 @@ bool probe( SDL_Renderer *renderer )
 
     SDL_GPUShader *post_vs = load_shader( device, "post3d.vert", SDL_GPU_SHADERSTAGE_VERTEX, 0 );
     SDL_GPUShader *post_fs = load_shader( device, "tonemap3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 1 );
+    SDL_GPUShader *gtao_fs = load_shader( device, "gtao3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
+    SDL_GPUShader *ao_blur_fs = load_shader( device, "gtao3d_blur.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 0,
+                                 1 );
+    SDL_GPUGraphicsPipelineCreateInfo ppi{};
+    ppi.vertex_shader = post_vs;
+    ppi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    ppi.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+    ppi.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+    ppi.target_info.num_color_targets = 1;
+    SDL_GPUColorTargetDescription pcolor_desc{};
+    ppi.target_info.color_target_descriptions = &pcolor_desc;
     if( post_vs && post_fs ) {
-        SDL_GPUGraphicsPipelineCreateInfo ppi{};
-        ppi.vertex_shader = post_vs;
         ppi.fragment_shader = post_fs;
-        ppi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
-        ppi.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
-        ppi.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
-        ppi.target_info.num_color_targets = 1;
-        SDL_GPUColorTargetDescription pcolor_desc{};
         pcolor_desc.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
-        ppi.target_info.color_target_descriptions = &pcolor_desc;
         g_ctx.post_pipeline = SDL_CreateGPUGraphicsPipeline( device, &ppi );
+    }
+    if( post_vs && gtao_fs ) {
+        ppi.fragment_shader = gtao_fs;
+        pcolor_desc.format = SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT;
+        g_ctx.gtao_pipeline = SDL_CreateGPUGraphicsPipeline( device, &ppi );
+    }
+    if( post_vs && ao_blur_fs ) {
+        ppi.fragment_shader = ao_blur_fs;
+        pcolor_desc.format = SDL_GPU_TEXTUREFORMAT_R16_FLOAT;
+        g_ctx.ao_blur_pipeline = SDL_CreateGPUGraphicsPipeline( device, &ppi );
     }
     if( post_vs ) {
         SDL_ReleaseGPUShader( device, post_vs );
@@ -1628,10 +1702,19 @@ bool probe( SDL_Renderer *renderer )
     if( post_fs ) {
         SDL_ReleaseGPUShader( device, post_fs );
     }
+    if( gtao_fs ) {
+        SDL_ReleaseGPUShader( device, gtao_fs );
+    }
+    if( ao_blur_fs ) {
+        SDL_ReleaseGPUShader( device, ao_blur_fs );
+    }
     if( !g_ctx.post_pipeline ) {
         write_status( "unavailable: HDR post pipeline creation failed" );
         g_ctx.teardown();
         return false;
+    }
+    if( !g_ctx.gtao_pipeline || !g_ctx.ao_blur_pipeline ) {
+        write_status( "GTAO pipeline unavailable; ambient occlusion disabled" );
     }
 
     // Optional final-composite tilt-shift. Missing artifacts fall back to the
@@ -1688,6 +1771,13 @@ bool probe( SDL_Renderer *renderer )
     g_ctx.shadow_sampler = SDL_CreateGPUSampler( device, &si );
     if( !g_ctx.shadow_sampler ) {
         write_status( "shadow sampler unavailable; sun shadows disabled" );
+    }
+    si.min_filter = SDL_GPU_FILTER_LINEAR;
+    si.mag_filter = SDL_GPU_FILTER_LINEAR;
+    si.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
+    g_ctx.linear_sampler = SDL_CreateGPUSampler( device, &si );
+    if( !g_ctx.linear_sampler ) {
+        write_status( "linear sampler unavailable; ambient occlusion disabled" );
     }
     if( !g_ctx.sampler ) {
         DebugLog( D_ERROR, DC_ALL ) << "render3d: sampler creation failed: " << SDL_GetError();
@@ -6322,10 +6412,12 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     const mat4 view = mat4_lookat( eye, target, { 0.0f, 0.0f, 1.0f } );
     // The orbit camera stays at least 6 units away; near=0.5 preserves far-depth
     // precision for ground decals viewed from upper levels.
+    constexpr float camera_near = 0.5f;
+    const float camera_far = std::max( 300.0f,
+                                       static_cast<float>( FAR_SUBMAP_RADIUS + 64 ) );
     const mat4 proj = mat4_perspective( 40.0f * 3.14159265f / 180.0f,
                                         static_cast<float>( w ) / static_cast<float>( h ),
-                                        0.5f, std::max( 300.0f,
-                                                static_cast<float>( FAR_SUBMAP_RADIUS + 64 ) ) );
+                                        camera_near, camera_far );
     const mat4 mvp = mat4_mul( proj, view );
     const view_frustum frustum = make_view_frustum( mvp );
 
@@ -6520,6 +6612,14 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     // cloud drift in noise space, following the wind
     const rl_vec2d wind_dir = convert_wind_to_coord( weather.winddirection );
     const float drift_scale = weather.windspeed * 0.01f * ( SDL_GetTicks() / 1000.0f );
+    const float precipitation = std::clamp(
+                                    static_cast<float>( static_cast<int>( weather.weather_id->precip ) ) / 3.0f,
+                                    0.0f, 1.0f );
+    constexpr float cloud_height = 160.0f;
+    constexpr float cloud_scale = 0.035f;
+    const float fog_strength = center.z() < 0 ? 0.0f
+                               : std::clamp( 0.28f + 0.20f * cloudiness + 0.20f * precipitation,
+                                       0.0f, 0.75f );
 
     // vertex-shader uniforms: mvp + billboard basis + geometry mode + sun
     struct vert_uniforms {
@@ -6549,7 +6649,10 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> params;  // x = tan(fov/2), y = aspect, z = cloudiness,
         // w = 1 in a night vision frame
         std::array<float, 4> wind;    // xy = cloud drift offset
+        std::array<float, 4> eye_pos;
+        std::array<float, 4> cloud_mapping; // xy = map origin, z = height, w = XY scale
     };
+    static_assert( sizeof( sky_uniforms ) == 8 * 16, "sky fragment UBO must match std140" );
     const bool nv_tint = nv_tint_active();
     sky_uniforms sky_ub{};
     sky_ub.cam_right = { g_basis_r.x, g_basis_r.y, g_basis_r.z, 0.0f };
@@ -6560,6 +6663,10 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
                       nv_tint ? 1.0f : 0.0f
                     };
     sky_ub.wind = { wind_dir.x * drift_scale, wind_dir.y * drift_scale, 0.0f, 0.0f };
+    sky_ub.eye_pos = { eye.x, eye.y, eye.z, 0.0f };
+    sky_ub.cloud_mapping = { static_cast<float>( center.x() ), static_cast<float>( center.y() ),
+                             cloud_height, cloud_scale
+                           };
 
     // fragment-shader uniforms: the camera->player occlusion mask. walls and
     // roofs on the eye-to-player segment fade out with a soft dithered edge so
@@ -6584,8 +6691,13 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> shadow_params;
         std::array<float, 4> light_params;
         std::array<float, 4> light_origin;
+        std::array<float, 4> atmosphere_sun;
+        std::array<float, 4> atmosphere_wind;
+        std::array<float, 4> atmosphere_params;
+        std::array<float, 4> atmosphere_origin;
+        std::array<float, 4> ao_params;
     };
-    static_assert( sizeof( frag_uniforms ) == 18 * 16, "terrain3d fragment UBO must match std140" );
+    static_assert( sizeof( frag_uniforms ) == 23 * 16, "terrain3d fragment UBO must match std140" );
     frag_uniforms frag_ub{};
     const tripoint_bub_ms upos = get_avatar().pos_bub();
     const float player_gz = ( upos.z() - center.z() ) * LEVEL_HEIGHT;
@@ -6629,6 +6741,32 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
                              static_cast<float>( center.z() + OVERMAP_DEPTH ), LEVEL_HEIGHT
                            };
     frag_ub.light_origin = { static_cast<float>( center.x() ), static_cast<float>( center.y() ), 0.0f, 0.0f };
+    frag_ub.atmosphere_sun = { sun_dir.x, sun_dir.y, sun_dir.z, center.z() < 0 ? 0.0f : daylight };
+    frag_ub.atmosphere_wind = { wind_dir.x * drift_scale, wind_dir.y * drift_scale,
+                                cloudiness, fog_strength
+                              };
+    frag_ub.atmosphere_params = { cloud_height, cloud_scale, 60.0f, camera_far * 0.9f };
+    frag_ub.atmosphere_origin = { static_cast<float>( center.x() ), static_cast<float>( center.y() ),
+                                  0.0f, 0.0f
+                                };
+    frag_ub.ao_params = { 0.0f, 0.7f, 60.0f, 140.0f };
+
+    struct gtao_uniforms {
+        std::array<float, 4> cam_right;
+        std::array<float, 4> cam_up;
+        std::array<float, 4> cam_forward;
+        std::array<float, 4> proj_params;
+        std::array<float, 4> screen_params;
+        std::array<float, 4> ao_params;
+    };
+    static_assert( sizeof( gtao_uniforms ) == 6 * 16, "GTAO fragment UBO must match std140" );
+    gtao_uniforms gtao_ub{};
+    gtao_ub.cam_right = sky_ub.cam_right;
+    gtao_ub.cam_up = sky_ub.cam_up;
+    gtao_ub.cam_forward = sky_ub.cam_forward;
+    gtao_ub.proj_params = { std::tan( g_fov_y * 0.5f ), g_aspect, camera_near, camera_far };
+    gtao_ub.screen_params = { static_cast<float>( w ), static_cast<float>( h ), 0.0f, 0.0f };
+    gtao_ub.ao_params = { 2.4f, 4.0f, 1.35f, 0.0f };
 
     // fallback clear color when the sky pass is unavailable
     const SDL_FColor sky{ 0.02f + 0.35f * daylight, 0.02f + 0.45f * daylight,
@@ -6664,6 +6802,10 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     const bool shadows_ready = caster_frustum && slot.shadow_tex && g_ctx.shadow_pipeline &&
                                g_ctx.shadow_sampler;
     frag_ub.shadow_params[0] = shadows_ready ? 1.0f : 0.0f;
+    const bool ao_ready = slot.depth_tex && slot.ao_raw_tex && slot.ao_tex &&
+                          g_ctx.prepass_pipeline && g_ctx.gtao_pipeline &&
+                          g_ctx.ao_blur_pipeline && g_ctx.linear_sampler;
+    frag_ub.ao_params[0] = ao_ready ? 1.0f : 0.0f;
 
     // upload instance data. A fully culled scene still renders the sky/clear,
     // but must not create a zero-sized transfer buffer or upload.
@@ -6794,7 +6936,91 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         SDL_EndGPURenderPass( shadow_pass );
     }
 
-    // pass 1: the world clears color/depth and writes all scene geometry.
+    if( ao_ready ) {
+        SDL_GPUDepthStencilTargetInfo prepass_depth{};
+        prepass_depth.texture = slot.depth_tex;
+        prepass_depth.load_op = SDL_GPU_LOADOP_CLEAR;
+        prepass_depth.store_op = SDL_GPU_STOREOP_STORE;
+        prepass_depth.clear_depth = 1.0f;
+        SDL_GPURenderPass *prepass = SDL_BeginGPURenderPass( cmd, nullptr, 0, &prepass_depth );
+        SDL_BindGPUGraphicsPipeline( prepass, g_ctx.prepass_pipeline );
+        SDL_GPUBufferBinding inst_bind{};
+        inst_bind.buffer = slot.instance_vb;
+        frag_ub.effect_params[3] = 1.0f;
+        for( const draw_segment &seg : segments ) {
+            if( seg.mode == MODE_FLATQUAD_DECAL || seg.mode == MODE_LINEQUAD_DECAL ) {
+                continue;
+            }
+            SDL_GPUBufferBinding geom_bind{};
+            int verts_per_instance = 36;
+            if( seg.mode == MODE_XQUAD ) {
+                geom_bind.buffer = g_ctx.xquad_vb;
+                verts_per_instance = 12;
+            } else if( seg.mode == MODE_FLATQUAD ) {
+                geom_bind.buffer = g_ctx.flatquad_vb;
+                verts_per_instance = 6;
+            } else if( seg.mode == MODE_BILLBOARD || seg.mode == MODE_BILLBOARD_SNAP ||
+                       seg.mode == MODE_LINEQUAD ) {
+                geom_bind.buffer = g_ctx.quad_vb;
+                verts_per_instance = 6;
+            } else {
+                geom_bind.buffer = g_ctx.cube_vb;
+            }
+            const SDL_GPUBufferBinding vbs[2] = { geom_bind, inst_bind };
+            SDL_BindGPUVertexBuffers( prepass, 0, vbs, 2 );
+            SDL_GPUTexture *atlas_gpu = seg.atlas ? gpu_texture_of( seg.atlas ) : g_ctx.fallback_tex;
+            SDL_GPUTextureSamplerBinding sampler_binds[4]{};
+            sampler_binds[0].texture = atlas_gpu ? atlas_gpu : g_ctx.fallback_tex;
+            sampler_binds[0].sampler = g_ctx.sampler;
+            sampler_binds[1].texture = shadows_ready ? slot.shadow_tex : g_ctx.fallback_tex;
+            sampler_binds[1].sampler = shadows_ready ? g_ctx.shadow_sampler : g_ctx.sampler;
+            sampler_binds[2].texture = light_hue_ready ? slot.light_tex : g_ctx.fallback_tex;
+            sampler_binds[2].sampler = g_ctx.sampler;
+            sampler_binds[3].texture = g_ctx.fallback_tex;
+            sampler_binds[3].sampler = g_ctx.linear_sampler;
+            SDL_BindGPUFragmentSamplers( prepass, 0, sampler_binds, 4 );
+            uniforms.params = { static_cast<float>( seg.mode ), 0.0f, 0.0f, 0.0f };
+            SDL_PushGPUVertexUniformData( cmd, 0, &uniforms, sizeof( uniforms ) );
+            frag_ub.mask_params[3] = ( seg.mode == MODE_BOX || seg.mode == MODE_LINEQUAD ||
+                                       seg.mode == MODE_FLATQUAD ) ? 1.0f : 0.0f;
+            SDL_PushGPUFragmentUniformData( cmd, 0, &frag_ub, sizeof( frag_ub ) );
+            SDL_DrawGPUPrimitives( prepass, verts_per_instance, seg.num_instances, 0, seg.first_instance );
+        }
+        SDL_EndGPURenderPass( prepass );
+        frag_ub.effect_params[3] = 0.0f;
+
+        SDL_GPUColorTargetInfo ao_raw_target{};
+        ao_raw_target.texture = slot.ao_raw_tex;
+        ao_raw_target.load_op = SDL_GPU_LOADOP_CLEAR;
+        ao_raw_target.store_op = SDL_GPU_STOREOP_STORE;
+        ao_raw_target.clear_color = { 1.0f, camera_far, 0.0f, 1.0f };
+        SDL_GPURenderPass *gtao_pass = SDL_BeginGPURenderPass( cmd, &ao_raw_target, 1, nullptr );
+        SDL_BindGPUGraphicsPipeline( gtao_pass, g_ctx.gtao_pipeline );
+        SDL_GPUTextureSamplerBinding depth_sampler{};
+        depth_sampler.texture = slot.depth_tex;
+        depth_sampler.sampler = g_ctx.sampler;
+        SDL_BindGPUFragmentSamplers( gtao_pass, 0, &depth_sampler, 1 );
+        SDL_PushGPUFragmentUniformData( cmd, 0, &gtao_ub, sizeof( gtao_ub ) );
+        SDL_DrawGPUPrimitives( gtao_pass, 3, 1, 0, 0 );
+        SDL_EndGPURenderPass( gtao_pass );
+
+        SDL_GPUColorTargetInfo ao_target{};
+        ao_target.texture = slot.ao_tex;
+        ao_target.load_op = SDL_GPU_LOADOP_CLEAR;
+        ao_target.store_op = SDL_GPU_STOREOP_STORE;
+        ao_target.clear_color = { 1.0f, 0.0f, 0.0f, 1.0f };
+        SDL_GPURenderPass *ao_blur_pass = SDL_BeginGPURenderPass( cmd, &ao_target, 1, nullptr );
+        SDL_BindGPUGraphicsPipeline( ao_blur_pass, g_ctx.ao_blur_pipeline );
+        SDL_GPUTextureSamplerBinding ao_raw_sampler{};
+        ao_raw_sampler.texture = slot.ao_raw_tex;
+        ao_raw_sampler.sampler = g_ctx.sampler;
+        SDL_BindGPUFragmentSamplers( ao_blur_pass, 0, &ao_raw_sampler, 1 );
+        SDL_DrawGPUPrimitives( ao_blur_pass, 3, 1, 0, 0 );
+        SDL_EndGPURenderPass( ao_blur_pass );
+    }
+
+    // pass 1: the world clears color, loads the AO prepass depth when present,
+    // and writes all scene geometry.
     SDL_GPUColorTargetInfo color_target{};
     color_target.texture = slot.hdr_tex;
     color_target.load_op = SDL_GPU_LOADOP_CLEAR;
@@ -6802,7 +7028,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     color_target.clear_color = sky;
     SDL_GPUDepthStencilTargetInfo depth_target{};
     depth_target.texture = slot.depth_tex;
-    depth_target.load_op = SDL_GPU_LOADOP_CLEAR;
+    depth_target.load_op = ao_ready ? SDL_GPU_LOADOP_LOAD : SDL_GPU_LOADOP_CLEAR;
     depth_target.store_op = g_ctx.sky_pipeline ? SDL_GPU_STOREOP_STORE : SDL_GPU_STOREOP_DONT_CARE;
     depth_target.clear_depth = 1.0f;
 
@@ -6841,14 +7067,16 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         const SDL_GPUBufferBinding vbs[2] = { geom_bind, inst_bind };
         SDL_BindGPUVertexBuffers( pass, 0, vbs, 2 );
         SDL_GPUTexture *atlas_gpu = seg.atlas ? gpu_texture_of( seg.atlas ) : g_ctx.fallback_tex;
-        SDL_GPUTextureSamplerBinding sampler_binds[3]{};
+        SDL_GPUTextureSamplerBinding sampler_binds[4]{};
         sampler_binds[0].texture = atlas_gpu ? atlas_gpu : g_ctx.fallback_tex;
         sampler_binds[0].sampler = g_ctx.sampler;
         sampler_binds[1].texture = shadows_ready ? slot.shadow_tex : g_ctx.fallback_tex;
         sampler_binds[1].sampler = shadows_ready ? g_ctx.shadow_sampler : g_ctx.sampler;
         sampler_binds[2].texture = light_hue_ready ? slot.light_tex : g_ctx.fallback_tex;
         sampler_binds[2].sampler = g_ctx.sampler;
-        SDL_BindGPUFragmentSamplers( pass, 0, sampler_binds, 3 );
+        sampler_binds[3].texture = ao_ready ? slot.ao_tex : g_ctx.fallback_tex;
+        sampler_binds[3].sampler = ao_ready ? g_ctx.linear_sampler : g_ctx.sampler;
+        SDL_BindGPUFragmentSamplers( pass, 0, sampler_binds, 4 );
         // decal modes share their geometry path with the plain modes
         // (6 -> flatquad 5, 7 -> fence linequad 4); the shader never sees them
         const int shader_mode = seg.mode == MODE_FLATQUAD_DECAL ? MODE_FLATQUAD :

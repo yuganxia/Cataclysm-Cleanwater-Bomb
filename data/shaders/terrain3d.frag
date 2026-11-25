@@ -5,12 +5,14 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 
+#include "atmosphere3d.glsl"
 #include "memory_presets.glsl"
 #include "nightvision_presets.glsl"
 
 layout(set = 2, binding = 0) uniform sampler2D atlas_tex;
 layout(set = 2, binding = 1) uniform sampler2D shadow_tex;
 layout(set = 2, binding = 2) uniform sampler2D light_tex;
+layout(set = 2, binding = 3) uniform sampler2D ao_tex;
 
 layout(set = 3, binding = 0) uniform FragUBO {
     vec4 eye_pos;      // xyz = camera position (scene coords)
@@ -25,11 +27,16 @@ layout(set = 3, binding = 0) uniform FragUBO {
     vec4 nv_params;     // x = 1 in a night vision frame (v_color.a then carries
                         // the tile light), y = night floor, z = overexpose start
     vec4 cursor_params; // xy = cursor in top-left screen UV, z = mask enabled
-    vec4 effect_params; // xy = cursor ellipse radii, z = inverse full wall height
+    vec4 effect_params; // xy = cursor ellipse radii, z = inverse full wall height, w = depth only
     mat4 light_vp;
     vec4 shadow_params; // x = enabled, y = texel size, z = depth bias
     vec4 light_params;  // x = enabled, y = rows per z, z = center layer, w = level height
     vec4 light_origin;  // xy = view center in map coordinates
+    vec4 atmosphere_sun; // xyz = direction toward sun, w = daylight
+    vec4 atmosphere_wind; // xy = cloud drift, z = cloudiness, w = fog strength
+    vec4 atmosphere_params; // x = cloud height, y = cloud scale, z = fog start, w = fog end
+    vec4 atmosphere_origin; // xy = view center in map coordinates
+    vec4 ao_params;     // x = enabled, y = strength, z = fade start, w = fade end
 };
 
 layout(location = 0) in vec4 v_color;
@@ -114,6 +121,47 @@ vec3 light_hue()
     }
     chroma /= weight_sum;
     return chroma / max( max( chroma.r, chroma.g ), max( chroma.b, 1.0e-4 ) );
+}
+
+float cloud_sun_visibility()
+{
+    if( v_sun <= 0.0 || atmosphere_sun.z <= 0.05 || atmosphere_sun.w <= 0.05 ) {
+        return 1.0;
+    }
+    float cloud_t = ( atmosphere_params.x - v_world.z ) / atmosphere_sun.z;
+    if( cloud_t < 0.0 ) {
+        return 1.0;
+    }
+    vec2 cloud_xy = v_world.xy + atmosphere_sun.xy * cloud_t;
+    vec2 coordinates = atmosphere_cloud_coordinates( cloud_xy, atmosphere_origin.xy,
+                       atmosphere_wind.xy, atmosphere_params.y );
+    float coverage = atmosphere_cloud_coverage( coordinates, atmosphere_wind.z );
+    return 1.0 - 0.65 * coverage;
+}
+
+float ambient_occlusion()
+{
+    if( ao_params.x < 0.5 ) {
+        return 1.0;
+    }
+    float ao = texture( ao_tex, v_screen ).r;
+    float distance_to_eye = length( v_world - eye_pos.xyz );
+    float fade = 1.0 - smoothstep( ao_params.z, ao_params.w, distance_to_eye );
+    return mix( 1.0, ao, ao_params.y * fade );
+}
+
+vec3 apply_air_perspective( vec3 rgb )
+{
+    if( atmosphere_wind.w <= 0.0 ) {
+        return rgb;
+    }
+    float distance_to_eye = length( v_world - eye_pos.xyz );
+    float fog = smoothstep( atmosphere_params.z, atmosphere_params.w, distance_to_eye );
+    fog *= atmosphere_wind.w * exp( -max( v_world.z, 0.0 ) * 0.01 );
+    vec3 fog_color = atmosphere_horizon_color( atmosphere_sun.w );
+    float gray = dot( fog_color, vec3( 0.25, 0.5, 0.25 ) );
+    fog_color = mix( fog_color, vec3( gray * 0.85 ), atmosphere_wind.z * 0.45 );
+    return mix( rgb, fog_color, clamp( fog, 0.0, 0.75 ) );
 }
 
 void main()
@@ -214,6 +262,10 @@ void main()
             discard;
         }
     }
+    if( effect_params.w > 0.5 ) {
+        out_color = vec4( 0.0 );
+        return;
+    }
     vec3 rgb = v_color.rgb * sampled.rgb;
     // remembered terrain (bit6): 2D draws the map-memory overlay unlit, colored
     // by MEMORY_MAP_MODE (a named preset or the custom RGB/gamma mixer), so the
@@ -247,6 +299,8 @@ void main()
     // tile light's saturation (1 = full color, 0 = grayscale)
     float gray = ( rgb.r + rgb.g + rgb.b ) / 3.0;
     rgb = mix( vec3( gray ), rgb, v_color.a );
-    float shade = v_shade - v_sun * ( 1.0 - sun_visibility() );
-    out_color = vec4( rgb * shade, composite_alpha );
+    float direct_sun = v_sun * sun_visibility() * cloud_sun_visibility();
+    float shade = ( v_shade - v_sun ) * ambient_occlusion() + direct_sun;
+    vec3 lit = apply_air_perspective( rgb * shade );
+    out_color = vec4( lit, composite_alpha );
 }
