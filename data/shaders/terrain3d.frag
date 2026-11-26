@@ -347,5 +347,5 @@ void main()
     vec3 emission = v_emission.rgb * ( textured ? sampled.rgb : vec3( 1.0 ) );
     vec3 lit = apply_air_perspective( rgb * shade ) + emission;
     out_color = vec4( lit, composite_alpha );
-    out_emissive = vec4( emission, 1.0 );
+    out_emissive = vec4( emission, ( flags & 16384 ) != 0 ? 1.0 : 0.0 );
 }

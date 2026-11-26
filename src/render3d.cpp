@@ -632,6 +632,7 @@ enum class frame_slot_state {
 struct frame_slot {
     SDL_GPUTexture *color_tex = nullptr;
     SDL_GPUTexture *hdr_tex = nullptr;
+    SDL_GPUTexture *water_tex = nullptr;
     SDL_GPUTexture *emissive_tex = nullptr;
     std::array<SDL_GPUTexture *, 2> bloom_tex{};
     SDL_GPUTexture *depth_tex = nullptr;
@@ -666,6 +667,7 @@ struct context {
     SDL_GPUGraphicsPipeline *post_bloom_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *bloom_extract_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *bloom_blur_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline *water_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *prepass_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *gtao_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *ao_blur_pipeline = nullptr;
@@ -1040,6 +1042,10 @@ void context::teardown()
                 SDL_ReleaseGPUTexture( device, slot.hdr_tex );
                 slot.hdr_tex = nullptr;
             }
+            if( slot.water_tex ) {
+                SDL_ReleaseGPUTexture( device, slot.water_tex );
+                slot.water_tex = nullptr;
+            }
             if( slot.emissive_tex ) {
                 SDL_ReleaseGPUTexture( device, slot.emissive_tex );
                 slot.emissive_tex = nullptr;
@@ -1162,6 +1168,10 @@ void context::teardown()
             SDL_ReleaseGPUGraphicsPipeline( device, bloom_blur_pipeline );
             bloom_blur_pipeline = nullptr;
         }
+        if( water_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, water_pipeline );
+            water_pipeline = nullptr;
+        }
         if( prepass_pipeline ) {
             SDL_ReleaseGPUGraphicsPipeline( device, prepass_pipeline );
             prepass_pipeline = nullptr;
@@ -1217,6 +1227,10 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
         if( slot.hdr_tex ) {
             SDL_ReleaseGPUTexture( g_ctx.device, slot.hdr_tex );
             slot.hdr_tex = nullptr;
+        }
+        if( slot.water_tex ) {
+            SDL_ReleaseGPUTexture( g_ctx.device, slot.water_tex );
+            slot.water_tex = nullptr;
         }
         if( slot.emissive_tex ) {
             SDL_ReleaseGPUTexture( g_ctx.device, slot.emissive_tex );
@@ -1281,7 +1295,11 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
         }
         slot.emissive_tex = SDL_CreateGPUTexture( g_ctx.device, &ci );
         if( !slot.emissive_tex ) {
-            write_status( "emissive target unavailable; Bloom disabled" );
+            write_status( "emissive target unavailable; Bloom and water disabled" );
+        }
+        slot.water_tex = SDL_CreateGPUTexture( g_ctx.device, &ci );
+        if( !slot.water_tex ) {
+            write_status( "water target unavailable; water reflections disabled" );
         }
 
         ci.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
@@ -1667,7 +1685,7 @@ bool probe( SDL_Renderer *renderer )
     mrtpi.depth_stencil_state.enable_depth_write = false;
     g_ctx.pipeline_decal_mrt = SDL_CreateGPUGraphicsPipeline( device, &mrtpi );
     if( !g_ctx.pipeline_mrt || !g_ctx.pipeline_decal_mrt ) {
-        write_status( "emissive MRT pipeline unavailable; Bloom disabled" );
+        write_status( "emissive MRT pipeline unavailable; Bloom and water disabled" );
     }
 
     SDL_GPUGraphicsPipelineCreateInfo dppi = pi;
@@ -1744,7 +1762,7 @@ bool probe( SDL_Renderer *renderer )
         spi.target_info.color_target_descriptions = sky_mrt_colors.data();
         g_ctx.sky_mrt_pipeline = SDL_CreateGPUGraphicsPipeline( device, &spi );
         if( !g_ctx.sky_mrt_pipeline ) {
-            write_status( "sky emissive MRT pipeline unavailable; Bloom disabled" );
+            write_status( "sky emissive MRT pipeline unavailable; Bloom and water disabled" );
         }
     } else {
         write_status( "sky shaders missing; procedural sky disabled" );
@@ -1767,6 +1785,8 @@ bool probe( SDL_Renderer *renderer )
                                     SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
     SDL_GPUShader *post_bloom_fs = load_shader( device, "tonemap3d_bloom.frag",
                                    SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 2 );
+    SDL_GPUShader *water_fs = load_shader( device, "water3d.frag",
+                                           SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 3 );
     SDL_GPUGraphicsPipelineCreateInfo ppi{};
     ppi.vertex_shader = post_vs;
     ppi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
@@ -1805,6 +1825,11 @@ bool probe( SDL_Renderer *renderer )
         pcolor_desc.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
         g_ctx.post_bloom_pipeline = SDL_CreateGPUGraphicsPipeline( device, &ppi );
     }
+    if( post_vs && water_fs ) {
+        ppi.fragment_shader = water_fs;
+        pcolor_desc.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+        g_ctx.water_pipeline = SDL_CreateGPUGraphicsPipeline( device, &ppi );
+    }
     if( post_vs ) {
         SDL_ReleaseGPUShader( device, post_vs );
     }
@@ -1826,6 +1851,9 @@ bool probe( SDL_Renderer *renderer )
     if( post_bloom_fs ) {
         SDL_ReleaseGPUShader( device, post_bloom_fs );
     }
+    if( water_fs ) {
+        SDL_ReleaseGPUShader( device, water_fs );
+    }
     if( !g_ctx.post_pipeline ) {
         write_status( "unavailable: HDR post pipeline creation failed" );
         g_ctx.teardown();
@@ -1837,6 +1865,9 @@ bool probe( SDL_Renderer *renderer )
     if( !g_ctx.bloom_extract_pipeline || !g_ctx.bloom_blur_pipeline ||
         !g_ctx.post_bloom_pipeline ) {
         write_status( "Bloom post pipeline unavailable; Bloom disabled" );
+    }
+    if( !g_ctx.water_pipeline ) {
+        write_status( "water pipeline unavailable; water reflections disabled" );
     }
 
     // Optional final-composite tilt-shift. Missing artifacts fall back to the
@@ -2588,6 +2619,7 @@ struct instance_sink {
 constexpr int CREATURE_HOSTILE_FLAG = 1 << 11;
 constexpr int CREATURE_NEUTRAL_FLAG = 1 << 12;
 constexpr int CREATURE_FRIENDLY_FLAG = 1 << 13;
+constexpr int WATER_FLAG = 1 << 14;
 
 std::array<float, 4> emission_from_light( const float emitted,
         const light_color_rgb &light_color = {} )
@@ -2612,7 +2644,7 @@ void push_instance( instance_sink out, const float dx, const float dy,
                     const bool ghost = false, const float saturation = 1.0f,
                     const bool memory = false, const bool soft_alpha = false,
                     const bool edge_skirt = false, const int creature_relation = 0,
-                    const std::array<float, 4> &emission = {} )
+                    const std::array<float, 4> &emission = {}, const bool water = false )
 {
     out.data[0] = dx;
     out.data[1] = dy;
@@ -2644,12 +2676,13 @@ void push_instance( instance_sink out, const float dx, const float dy,
     // the offscreen alpha channel so tilt-shift never blurs detailed terrain
     // bit10: same-level wall — solid lower third, dithered fade, transparent top
     // bit11-13: hostile / neutral / friendly creature outline for the composite
+    // bit14: water top surface, exported through the emissive target's alpha
     // pad: side-strip v, or the run direction for MODE_LINEQUAD (0 = E-W)
     out.data[14] = ( spr.atlas ? 1.0f : 0.0f ) + ( no_discard ? 2.0f : 0.0f ) +
                    static_cast<float>( ( rota4 & 3 ) << 2 ) + ( side_strip ? 16.0f : 0.0f ) +
                    ( ghost ? 32.0f : 0.0f ) + ( memory ? 64.0f : 0.0f ) +
                    ( soft_alpha ? 128.0f : 0.0f ) + ( edge_skirt ? 256.0f : 0.0f ) +
-                   static_cast<float>( creature_relation );
+                   static_cast<float>( creature_relation ) + ( water ? WATER_FLAG : 0 );
     out.data[15] = pad_value >= 0.0f ? pad_value
                    : ( side_strip ? spr.v1 - 0.02f * ( spr.v1 - spr.v0 ) : 0.0f );
     out.data[16] = emission[0];
@@ -4062,6 +4095,10 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                 }
                 const std::array<float, 4> terrain_emission = emission_from_light(
                             t->light_emitted, t->light_color );
+                const bool is_water = t->has_flag( ter_furn_flag::TFLAG_SWIMMABLE ) ||
+                                      t->has_flag( ter_furn_flag::TFLAG_DEEP_WATER ) ||
+                                      t->has_flag( ter_furn_flag::TFLAG_SHALLOW_WATER ) ||
+                                      t->has_flag( ter_furn_flag::TFLAG_NO_FLOOR_WATER );
                 // A floor-blocked cell exposes only its wall face. The shared
                 // classifier and wall-specific light query must both pass;
                 // nothing else in this cell becomes visible through this path.
@@ -4290,7 +4327,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                         push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
                                        wz - 0.001f, 1.0f, 1.0f, 1.0f, ground_spr,
                                        gr, gg, gb, false, ground_rot4, false, -1.0f, ghost,
-                                       tone.sat, false, false, false, 0, terrain_emission );
+                                       tone.sat, false, false, false, 0, terrain_emission,
+                                       is_water );
                         ++count;
                     } else {
                         sprite_info gspr = ground_spr;
@@ -4302,7 +4340,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                         push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
                                        wz - FLOOR_THICK - 0.001f, 1.0f, 1.0f, FLOOR_THICK, gspr,
                                        gr, gg, gb, true, ground_rot4, false, -1.0f, ghost,
-                                       tone.sat, false, false, false, 0, terrain_emission );
+                                       tone.sat, false, false, false, 0, terrain_emission,
+                                       is_water && !btex && !dtex );
                         ++count;
                     }
                 }
@@ -4333,7 +4372,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                     push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
                                    wz + 0.004f, 1.0f, 1.0f, 1.0f, fspr, or_, og, ob,
                                    false, 0, false, -1.0f, ghost, tone.sat,
-                                   false, false, false, 0, terrain_emission );
+                                   false, false, false, 0, terrain_emission, is_water );
                     ++count;
                 }
 
@@ -6864,6 +6903,36 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
                              cloud_height, cloud_scale
                            };
 
+    struct water_uniforms {
+        mat4 view_proj;
+        std::array<float, 4> eye_pos;
+        std::array<float, 4> cam_right;
+        std::array<float, 4> cam_up;
+        std::array<float, 4> cam_forward;
+        std::array<float, 4> sun_dir;
+        std::array<float, 4> ray_params;
+        std::array<float, 4> wind;
+        std::array<float, 4> cloud_mapping;
+        std::array<float, 4> water_params;
+    };
+    static_assert( sizeof( water_uniforms ) == 13 * 16, "water fragment UBO must match std140" );
+    water_uniforms water_ub{};
+    water_ub.view_proj = mvp;
+    water_ub.eye_pos = sky_ub.eye_pos;
+    water_ub.cam_right = sky_ub.cam_right;
+    water_ub.cam_up = sky_ub.cam_up;
+    water_ub.cam_forward = sky_ub.cam_forward;
+    water_ub.sun_dir = sky_ub.sun_dir;
+    water_ub.sun_dir[3] = center.z() < 0 ? 0.0f : daylight;
+    water_ub.ray_params = { std::tan( g_fov_y * 0.5f ), g_aspect, camera_near, camera_far };
+    water_ub.wind = { sky_ub.wind[0], sky_ub.wind[1], cloudiness, 0.0f };
+    water_ub.cloud_mapping = sky_ub.cloud_mapping;
+    water_ub.water_params = {
+        static_cast<float>( SDL_GetTicks() / 1000.0 ),
+        std::clamp( 0.035f + weather.windspeed * 0.0025f, 0.035f, 0.09f ),
+        36.0f, 0.12f
+    };
+
     // fragment-shader uniforms: the camera->player occlusion mask. walls and
     // roofs on the eye-to-player segment fade out with a soft dithered edge so
     // they never block the player; only box instances (terrain geometry) mask
@@ -7004,12 +7073,17 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
                           g_ctx.prepass_pipeline && g_ctx.gtao_pipeline &&
                           g_ctx.ao_blur_pipeline && g_ctx.linear_sampler;
     frag_ub.ao_params[0] = ao_ready ? 1.0f : 0.0f;
-    const bool bloom_ready = !nv_tint_active() && slot.emissive_tex &&
+    const bool mrt_ready = slot.emissive_tex && g_ctx.pipeline_mrt &&
+                           g_ctx.pipeline_decal_mrt &&
+                           ( !g_ctx.sky_pipeline || g_ctx.sky_mrt_pipeline );
+    const bool bloom_ready = !nv_tint_active() && mrt_ready &&
                              slot.bloom_tex[0] && slot.bloom_tex[1] &&
-                             g_ctx.pipeline_mrt && g_ctx.pipeline_decal_mrt &&
-                             ( !g_ctx.sky_pipeline || g_ctx.sky_mrt_pipeline ) &&
                              g_ctx.bloom_extract_pipeline && g_ctx.bloom_blur_pipeline &&
                              g_ctx.post_bloom_pipeline && g_ctx.linear_sampler;
+    const bool water_ready = !nv_tint_active() && mrt_ready && slot.water_tex &&
+                             slot.depth_tex && g_ctx.water_pipeline &&
+                             g_ctx.sampler && g_ctx.linear_sampler;
+    const bool mrt_active = bloom_ready || water_ready;
 
     // upload instance data. A fully culled scene still renders the sky/clear,
     // but must not create a zero-sized transfer buffer or upload.
@@ -7239,16 +7313,17 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     SDL_GPUDepthStencilTargetInfo depth_target{};
     depth_target.texture = slot.depth_tex;
     depth_target.load_op = ao_ready ? SDL_GPU_LOADOP_LOAD : SDL_GPU_LOADOP_CLEAR;
-    depth_target.store_op = g_ctx.sky_pipeline ? SDL_GPU_STOREOP_STORE : SDL_GPU_STOREOP_DONT_CARE;
+    depth_target.store_op = g_ctx.sky_pipeline || water_ready ? SDL_GPU_STOREOP_STORE :
+                            SDL_GPU_STOREOP_DONT_CARE;
     depth_target.clear_depth = 1.0f;
 
     SDL_GPURenderPass *pass = SDL_BeginGPURenderPass( cmd, world_targets,
-                                bloom_ready ? 2 : 1, &depth_target );
-    SDL_BindGPUGraphicsPipeline( pass, bloom_ready ? g_ctx.pipeline_mrt : g_ctx.pipeline );
+                                mrt_active ? 2 : 1, &depth_target );
+    SDL_BindGPUGraphicsPipeline( pass, mrt_active ? g_ctx.pipeline_mrt : g_ctx.pipeline );
     SDL_GPUBufferBinding inst_bind{};
     inst_bind.buffer = slot.instance_vb;
     inst_bind.offset = 0;
-    SDL_GPUGraphicsPipeline *bound_pipeline = bloom_ready ? g_ctx.pipeline_mrt : g_ctx.pipeline;
+    SDL_GPUGraphicsPipeline *bound_pipeline = mrt_active ? g_ctx.pipeline_mrt : g_ctx.pipeline;
     for( const draw_segment &seg : segments ) {
         // decals draw with the depth-write-off pipeline: painter's order
         // (instance order = 2D's row order) resolves decal-vs-decal overlaps,
@@ -7256,8 +7331,8 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         const bool decal_seg = seg.mode == MODE_FLATQUAD_DECAL ||
                                seg.mode == MODE_LINEQUAD_DECAL;
         SDL_GPUGraphicsPipeline *want = decal_seg
-                                        ? ( bloom_ready ? g_ctx.pipeline_decal_mrt : g_ctx.pipeline_decal )
-                                        : ( bloom_ready ? g_ctx.pipeline_mrt : g_ctx.pipeline );
+                                        ? ( mrt_active ? g_ctx.pipeline_decal_mrt : g_ctx.pipeline_decal )
+                                        : ( mrt_active ? g_ctx.pipeline_mrt : g_ctx.pipeline );
         if( want != bound_pipeline ) {
             SDL_BindGPUGraphicsPipeline( pass, want );
             bound_pipeline = want;
@@ -7324,14 +7399,35 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         SDL_GPUDepthStencilTargetInfo sky_depth{};
         sky_depth.texture = slot.depth_tex;
         sky_depth.load_op = SDL_GPU_LOADOP_LOAD;
-        sky_depth.store_op = SDL_GPU_STOREOP_DONT_CARE;
+        sky_depth.store_op = water_ready ? SDL_GPU_STOREOP_STORE : SDL_GPU_STOREOP_DONT_CARE;
         SDL_GPURenderPass *sky_pass = SDL_BeginGPURenderPass( cmd, sky_targets,
-                                      bloom_ready ? 2 : 1, &sky_depth );
+                                      mrt_active ? 2 : 1, &sky_depth );
         SDL_BindGPUGraphicsPipeline( sky_pass,
-                                     bloom_ready ? g_ctx.sky_mrt_pipeline : g_ctx.sky_pipeline );
+                                     mrt_active ? g_ctx.sky_mrt_pipeline : g_ctx.sky_pipeline );
         SDL_PushGPUFragmentUniformData( cmd, 0, &sky_ub, sizeof( sky_ub ) );
         SDL_DrawGPUPrimitives( sky_pass, 3, 1, 0, 0 );
         SDL_EndGPURenderPass( sky_pass );
+    }
+
+    if( water_ready ) {
+        SDL_GPUColorTargetInfo water_target{};
+        water_target.texture = slot.water_tex;
+        water_target.load_op = SDL_GPU_LOADOP_CLEAR;
+        water_target.store_op = SDL_GPU_STOREOP_STORE;
+        water_target.clear_color = { 0.0f, 0.0f, 0.0f, 1.0f };
+        SDL_GPURenderPass *water_pass = SDL_BeginGPURenderPass( cmd, &water_target, 1, nullptr );
+        SDL_BindGPUGraphicsPipeline( water_pass, g_ctx.water_pipeline );
+        SDL_GPUTextureSamplerBinding water_samplers[3]{};
+        water_samplers[0].texture = slot.hdr_tex;
+        water_samplers[0].sampler = g_ctx.linear_sampler;
+        water_samplers[1].texture = slot.depth_tex;
+        water_samplers[1].sampler = g_ctx.sampler;
+        water_samplers[2].texture = slot.emissive_tex;
+        water_samplers[2].sampler = g_ctx.sampler;
+        SDL_BindGPUFragmentSamplers( water_pass, 0, water_samplers, 3 );
+        SDL_PushGPUFragmentUniformData( cmd, 0, &water_ub, sizeof( water_ub ) );
+        SDL_DrawGPUPrimitives( water_pass, 3, 1, 0, 0 );
+        SDL_EndGPURenderPass( water_pass );
     }
 
     int bloom_source = 0;
@@ -7388,7 +7484,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     SDL_BindGPUGraphicsPipeline( post_pass,
                                  bloom_ready ? g_ctx.post_bloom_pipeline : g_ctx.post_pipeline );
     SDL_GPUTextureSamplerBinding post_samplers[2]{};
-    post_samplers[0].texture = slot.hdr_tex;
+    post_samplers[0].texture = water_ready ? slot.water_tex : slot.hdr_tex;
     post_samplers[0].sampler = g_ctx.sampler;
     post_samplers[1].texture = slot.bloom_tex[bloom_source];
     post_samplers[1].sampler = g_ctx.linear_sampler;

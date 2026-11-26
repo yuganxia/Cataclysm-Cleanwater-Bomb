@@ -152,7 +152,12 @@ void main()
     v_screen = vec2( ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5 );
     v_color = a_inst_color;
     v_uv = mix( a_inst_uv0, a_inst_uv1, uv_local );
-    v_flags = a_inst_flags;
+    int out_flags = int( a_inst_flags + 0.5 );
+    if( ( out_flags & 16384 ) != 0 &&
+        !( ( mode == 0 && a_aux.z > 0.5 ) || mode == 5 ) ) {
+        out_flags &= ~16384;
+    }
+    v_flags = float( out_flags );
     v_shade = shade;
     v_emission = a_inst_emission;
 }
