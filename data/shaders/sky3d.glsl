@@ -4,8 +4,8 @@
 #include "atmosphere3d.glsl"
 
 vec3 sky3d_radiance( vec3 ray, vec3 eye_position, vec3 sun_direction, float daylight,
-                     float cloudiness, float storminess, vec2 wind_offset, vec2 map_origin,
-                     float cloud_height, float cloud_scale, out vec3 sun_emission )
+                     float cloudiness, float storminess, float fog_strength, vec2 wind_offset,
+                     vec2 map_origin, float cloud_height, float cloud_scale, out vec3 sun_emission )
 {
     vec3 zenith = mix( vec3( 0.004, 0.005, 0.012 ), vec3( 0.22, 0.42, 0.75 ), daylight );
     vec3 horizon = atmosphere_horizon_color( daylight );
@@ -61,6 +61,12 @@ vec3 sky3d_radiance( vec3 ray, vec3 eye_position, vec3 sun_direction, float dayl
             col = mix( col, cloud_col, cov );
             sun_emission *= 1.0 - cov;
         }
+    }
+    if( fog_strength > 0.0 ) {
+        float horizon_haze = pow( 1.0 - clamp( abs( ray.z ), 0.0, 1.0 ), 3.0 );
+        float fog = min( horizon_haze * fog_strength, 0.88 );
+        col = mix( col, atmosphere_fog_color( daylight, cloudiness ), fog );
+        sun_emission *= 1.0 - fog;
     }
     return col;
 }

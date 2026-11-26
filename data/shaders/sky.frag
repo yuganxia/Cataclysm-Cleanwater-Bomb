@@ -16,7 +16,7 @@ layout(set = 3, binding = 0) uniform SkyUBO {
     vec4 cam_forward;  // xyz = camera forward basis
     vec4 sun_dir;      // xyz = direction toward the sun (world), w = daylight 0..1
     vec4 params;       // x = tan(fov/2), y = aspect, z = cloudiness, w = night vision
-    vec4 wind;         // xy = cloud drift offset in noise space, z = storminess
+    vec4 wind;         // xy = cloud drift, z = storminess, w = fog strength
     vec4 eye_pos;      // xyz = camera position in scene coordinates
     vec4 cloud_mapping; // xy = map origin, z = cloud height, w = cloud XY scale
 };
@@ -32,7 +32,7 @@ void main()
                           + cam_up.xyz * ( v_ndc.y * params.x ) );
     float daylight = clamp( sun_dir.w, 0.0, 1.0 );
     vec3 sun_emission;
-    vec3 col = sky3d_radiance( ray, eye_pos.xyz, sun_dir.xyz, daylight, params.z, wind.z,
+    vec3 col = sky3d_radiance( ray, eye_pos.xyz, sun_dir.xyz, daylight, params.z, wind.z, wind.w,
                                wind.xy, cloud_mapping.xy, cloud_mapping.z, cloud_mapping.w,
                                sun_emission );
 

@@ -18,6 +18,7 @@ layout(set = 3, binding = 0) uniform WaterUBO {
     vec4 wind;          // xy = cloud drift, z = cloudiness, w = storminess
     vec4 cloud_mapping; // xy = map origin, z = cloud height, w = cloud XY scale
     vec4 water_params;  // x = seconds, y = wave slope, z = max ray distance, w = depth thickness
+    vec4 weather_params; // x = fog strength
 };
 
 layout(location = 0) in vec2 v_uv;
@@ -123,7 +124,7 @@ void main()
     vec3 reflected_direction = normalize( reflect( view_direction, normal ) );
     vec3 reflected_sun;
     vec3 sky = sky3d_radiance( reflected_direction, eye_pos.xyz, sun_dir.xyz,
-                               clamp( sun_dir.w, 0.0, 1.0 ), wind.z, wind.w, wind.xy,
+                               clamp( sun_dir.w, 0.0, 1.0 ), wind.z, wind.w, weather_params.x, wind.xy,
                                cloud_mapping.xy, cloud_mapping.z, cloud_mapping.w,
                                reflected_sun );
 

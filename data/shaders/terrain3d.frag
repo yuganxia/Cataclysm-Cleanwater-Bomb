@@ -215,10 +215,8 @@ vec3 apply_air_perspective( vec3 rgb )
     float distance_to_eye = length( v_world - eye_pos.xyz );
     float fog = smoothstep( atmosphere_params.z, atmosphere_params.w, distance_to_eye );
     fog *= atmosphere_wind.w * exp( -max( v_world.z, 0.0 ) * 0.01 );
-    vec3 fog_color = atmosphere_horizon_color( atmosphere_sun.w );
-    float gray = dot( fog_color, vec3( 0.25, 0.5, 0.25 ) );
-    fog_color = mix( fog_color, vec3( gray * 0.85 ), atmosphere_wind.z * 0.45 );
-    return mix( rgb, fog_color, clamp( fog, 0.0, 0.75 ) );
+    vec3 fog_color = atmosphere_fog_color( atmosphere_sun.w, atmosphere_wind.z );
+    return mix( rgb, fog_color, clamp( fog, 0.0, 0.88 ) );
 }
 
 void main()

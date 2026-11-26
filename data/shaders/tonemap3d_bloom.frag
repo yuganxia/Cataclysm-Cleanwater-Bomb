@@ -1,4 +1,7 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "weather3d.glsl"
 
 layout(set = 2, binding = 0) uniform sampler2D hdr_tex;
 layout(set = 2, binding = 1) uniform sampler2D bloom_tex;
@@ -11,6 +14,7 @@ void main()
     vec4 color = texture( hdr_tex, v_uv );
     vec3 bloom = max( texture( bloom_tex, v_uv ).rgb, vec3( 0.0 ) );
     vec3 rgb = max( color.rgb, vec3( 0.0 ) ) + bloom * 0.18;
+    rgb = weather3d_apply( rgb, v_uv );
     float peak = max( rgb.r, max( rgb.g, rgb.b ) );
     const float shoulder = 0.8;
     if( peak > shoulder ) {

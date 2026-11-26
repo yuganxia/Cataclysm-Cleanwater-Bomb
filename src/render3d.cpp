@@ -154,6 +154,9 @@ constexpr int LIGHT_TEXTURE_WIDTH = MAPSIZE_X;
 constexpr int LIGHT_TEXTURE_HEIGHT = MAPSIZE_Y * OVERMAP_LAYERS;
 constexpr size_t LIGHT_LAYER_BYTES = static_cast<size_t>( MAPSIZE_X ) * MAPSIZE_Y *
                                      sizeof( smooth_lighting::lightmap_texel );
+constexpr int WEATHER_MASK_LAYERS = 3;
+constexpr int WEATHER_MASK_HEIGHT = MAPSIZE_Y * WEATHER_MASK_LAYERS;
+constexpr size_t WEATHER_MASK_BYTES = static_cast<size_t>( MAPSIZE_X ) * WEATHER_MASK_HEIGHT;
 constexpr float FLOOR_THICK = 0.1f;
 // wall tops end inside the next level's floor slab: high enough to close the
 // seam, but below the slab top so they cannot replace the upper floor surface
@@ -642,6 +645,11 @@ struct frame_slot {
     SDL_GPUTexture *light_tex = nullptr;
     SDL_Texture *color_tex_sdl = nullptr;
     SDL_GPUTransferBuffer *light_tb = nullptr;
+    SDL_GPUTexture *weather_mask_tex = nullptr;
+    SDL_GPUTransferBuffer *weather_mask_tb = nullptr;
+    int weather_mask_center_z = 0;
+    Uint64 weather_mask_updated = 0;
+    bool weather_mask_valid = false;
     std::array<uint64_t, OVERMAP_LAYERS> light_generations{};
     bool light_tint = true;
     SDL_GPUBuffer *instance_vb = nullptr;
@@ -1080,6 +1088,15 @@ void context::teardown()
                 SDL_ReleaseGPUTransferBuffer( device, slot.light_tb );
                 slot.light_tb = nullptr;
             }
+            if( slot.weather_mask_tex ) {
+                SDL_ReleaseGPUTexture( device, slot.weather_mask_tex );
+                slot.weather_mask_tex = nullptr;
+            }
+            if( slot.weather_mask_tb ) {
+                SDL_ReleaseGPUTransferBuffer( device, slot.weather_mask_tb );
+                slot.weather_mask_tb = nullptr;
+            }
+            slot.weather_mask_valid = false;
             slot.light_generations.fill( std::numeric_limits<uint64_t>::max() );
             if( slot.instance_tb ) {
                 SDL_ReleaseGPUTransferBuffer( device, slot.instance_tb );
@@ -1266,6 +1283,15 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
             SDL_ReleaseGPUTransferBuffer( g_ctx.device, slot.light_tb );
             slot.light_tb = nullptr;
         }
+        if( slot.weather_mask_tex ) {
+            SDL_ReleaseGPUTexture( g_ctx.device, slot.weather_mask_tex );
+            slot.weather_mask_tex = nullptr;
+        }
+        if( slot.weather_mask_tb ) {
+            SDL_ReleaseGPUTransferBuffer( g_ctx.device, slot.weather_mask_tb );
+            slot.weather_mask_tb = nullptr;
+        }
+        slot.weather_mask_valid = false;
         slot.light_generations.fill( std::numeric_limits<uint64_t>::max() );
     }
 
@@ -1333,6 +1359,19 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
         }
         slot.light_generations.fill( std::numeric_limits<uint64_t>::max() );
         slot.light_tint = true;
+
+        ci.format = SDL_GPU_TEXTUREFORMAT_R8_UNORM;
+        ci.width = MAPSIZE_X;
+        ci.height = WEATHER_MASK_HEIGHT;
+        slot.weather_mask_tex = SDL_CreateGPUTexture( g_ctx.device, &ci );
+        SDL_GPUTransferBufferCreateInfo weather_ti{};
+        weather_ti.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+        weather_ti.size = static_cast<Uint32>( WEATHER_MASK_BYTES );
+        slot.weather_mask_tb = SDL_CreateGPUTransferBuffer( g_ctx.device, &weather_ti );
+        slot.weather_mask_valid = false;
+        if( !slot.weather_mask_tex || !slot.weather_mask_tb ) {
+            write_status( "weather roof mask unavailable; precipitation disabled" );
+        }
 
         ci.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
         ci.width = static_cast<Uint32>( ( w + 1 ) / 2 );
@@ -1442,6 +1481,55 @@ bool upload_light_hue( SDL_GPUCommandBuffer *cmd, frame_slot &slot, map &here )
     }
     SDL_EndGPUCopyPass( copy );
     SDL_UnmapGPUTransferBuffer( g_ctx.device, slot.light_tb );
+    return true;
+}
+
+bool upload_weather_mask( SDL_GPUCommandBuffer *cmd, frame_slot &slot, map &here,
+                          const int center_z, const Uint64 now_ticks )
+{
+    if( !slot.weather_mask_tex || !slot.weather_mask_tb ) {
+        return false;
+    }
+    if( slot.weather_mask_valid && slot.weather_mask_center_z == center_z &&
+        now_ticks - slot.weather_mask_updated < 250 ) {
+        return true;
+    }
+    auto *mapped = static_cast<uint8_t *>( SDL_MapGPUTransferBuffer( g_ctx.device,
+                                           slot.weather_mask_tb, false ) );
+    if( !mapped ) {
+        return false;
+    }
+    for( int layer = 0; layer < WEATHER_MASK_LAYERS; ++layer ) {
+        const int z = center_z + layer - 1;
+        for( int y = 0; y < MAPSIZE_Y; ++y ) {
+            for( int x = 0; x < MAPSIZE_X; ++x ) {
+                const tripoint_bub_ms p( x, y, z );
+                const bool exposed = here.inbounds( p ) && !here.is_roofed( p );
+                mapped[layer * MAPSIZE_X * MAPSIZE_Y + y * MAPSIZE_X + x] = exposed ? 255 : 0;
+            }
+        }
+    }
+
+    SDL_GPUTextureTransferInfo src{};
+    src.transfer_buffer = slot.weather_mask_tb;
+    src.pixels_per_row = MAPSIZE_X;
+    src.rows_per_layer = WEATHER_MASK_HEIGHT;
+    SDL_GPUTextureRegion region{};
+    region.texture = slot.weather_mask_tex;
+    region.w = MAPSIZE_X;
+    region.h = WEATHER_MASK_HEIGHT;
+    region.d = 1;
+    SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass( cmd );
+    if( !copy ) {
+        SDL_UnmapGPUTransferBuffer( g_ctx.device, slot.weather_mask_tb );
+        return false;
+    }
+    SDL_UploadToGPUTexture( copy, &src, &region, false );
+    SDL_EndGPUCopyPass( copy );
+    SDL_UnmapGPUTransferBuffer( g_ctx.device, slot.weather_mask_tb );
+    slot.weather_mask_center_z = center_z;
+    slot.weather_mask_updated = now_ticks;
+    slot.weather_mask_valid = true;
     return true;
 }
 
@@ -1775,7 +1863,7 @@ bool probe( SDL_Renderer *renderer )
     }
 
     SDL_GPUShader *post_vs = load_shader( device, "post3d.vert", SDL_GPU_SHADERSTAGE_VERTEX, 0 );
-    SDL_GPUShader *post_fs = load_shader( device, "tonemap3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 1 );
+    SDL_GPUShader *post_fs = load_shader( device, "tonemap3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 4 );
     SDL_GPUShader *gtao_fs = load_shader( device, "gtao3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
     SDL_GPUShader *ao_blur_fs = load_shader( device, "gtao3d_blur.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 0,
                                  1 );
@@ -1784,7 +1872,7 @@ bool probe( SDL_Renderer *renderer )
     SDL_GPUShader *bloom_blur_fs = load_shader( device, "bloom3d_blur.frag",
                                     SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
     SDL_GPUShader *post_bloom_fs = load_shader( device, "tonemap3d_bloom.frag",
-                                   SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 2 );
+                                   SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 4 );
     SDL_GPUShader *water_fs = load_shader( device, "water3d.frag",
                                            SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 3 );
     SDL_GPUGraphicsPipelineCreateInfo ppi{};
@@ -6863,37 +6951,57 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
                                            precipitation_cover ), 0.0f, 1.0f );
     const float target_storm = std::clamp( ( target_cover - 0.5f ) * 0.9f +
                                            precipitation * 0.45f, 0.0f, 1.0f );
-    struct cloud_visual_state {
+    const bool precipitation_animation = center.z() >= 0 && get_option<bool>( "ANIMATIONS" ) &&
+                                         get_option<bool>( "ANIMATION_RAIN" );
+    const float animated_precipitation = precipitation_animation ? precipitation : 0.0f;
+    const float target_rain = weather.weather_id->rains ? animated_precipitation : 0.0f;
+    const float target_snow = weather.weather_id->rains ? 0.0f : animated_precipitation;
+    const float visibility_loss = std::clamp( 1.0f - weather.weather_id->sight_penalty, 0.0f, 1.0f );
+    const float target_fog = center.z() < 0 ? 0.0f
+                             : std::clamp( 0.20f + 0.12f * target_cover + 0.10f * precipitation +
+                                           0.62f * visibility_loss, 0.0f, 0.88f );
+    struct weather_visual_state {
         float cover = 0.0f;
         float storm = 0.0f;
+        float rain = 0.0f;
+        float snow = 0.0f;
+        float fog = 0.0f;
         Uint64 last_ticks = 0;
         bool initialized = false;
     };
-    static cloud_visual_state cloud_state;
+    static weather_visual_state weather_state;
     const Uint64 now_ticks = SDL_GetTicks();
     const float now_seconds = static_cast<float>( now_ticks / 1000.0 );
-    if( !cloud_state.initialized ) {
-        cloud_state.cover = target_cover;
-        cloud_state.storm = target_storm;
-        cloud_state.initialized = true;
+    if( !weather_state.initialized ) {
+        weather_state.cover = target_cover;
+        weather_state.storm = target_storm;
+        weather_state.rain = target_rain;
+        weather_state.snow = target_snow;
+        weather_state.fog = target_fog;
+        weather_state.initialized = true;
     } else {
-        const float dt = std::clamp( static_cast<float>( now_ticks - cloud_state.last_ticks ) / 1000.0f,
+        const float dt = std::clamp( static_cast<float>( now_ticks - weather_state.last_ticks ) / 1000.0f,
                                      0.0f, 0.25f );
         const float blend = 1.0f - std::exp( -dt * 2.4f );
-        cloud_state.cover += ( target_cover - cloud_state.cover ) * blend;
-        cloud_state.storm += ( target_storm - cloud_state.storm ) * blend;
+        weather_state.cover += ( target_cover - weather_state.cover ) * blend;
+        weather_state.storm += ( target_storm - weather_state.storm ) * blend;
+        weather_state.rain += ( target_rain - weather_state.rain ) * blend;
+        weather_state.snow += ( target_snow - weather_state.snow ) * blend;
+        weather_state.fog += ( target_fog - weather_state.fog ) * blend;
     }
-    cloud_state.last_ticks = now_ticks;
-    const float cloudiness = cloud_state.cover;
-    const float storminess = cloud_state.storm;
+    weather_state.last_ticks = now_ticks;
+    const float cloudiness = weather_state.cover;
+    const float storminess = weather_state.storm;
+    const float fog_strength = weather_state.fog;
     // cloud drift in noise space, following the wind
     const rl_vec2d wind_dir = convert_wind_to_coord( weather.winddirection );
     const float drift_scale = weather.windspeed * 0.01f * now_seconds;
     constexpr float cloud_height = 160.0f;
     constexpr float cloud_scale = 0.035f;
-    const float fog_strength = center.z() < 0 ? 0.0f
-                               : std::clamp( 0.28f + 0.20f * cloudiness + 0.20f * precipitation,
-                                       0.0f, 0.75f );
+    const float fog_severity = std::clamp( ( fog_strength - 0.20f ) / 0.68f, 0.0f, 1.0f );
+    const float fog_start = 70.0f + ( 18.0f - 70.0f ) * fog_severity;
+    const float fog_end = std::max( fog_start + 10.0f,
+                                    ( camera_far * 0.9f ) * ( 1.0f - fog_severity ) + 55.0f * fog_severity );
 
     // vertex-shader uniforms: mvp + billboard basis + geometry mode + sun
     struct vert_uniforms {
@@ -6922,7 +7030,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> sun_dir; // xyz = toward sun, w = daylight
         std::array<float, 4> params;  // x = tan(fov/2), y = aspect, z = cloudiness,
         // w = 1 in a night vision frame
-        std::array<float, 4> wind;    // xy = cloud drift offset, z = storminess
+        std::array<float, 4> wind;    // xy = cloud drift offset, z = storminess, w = fog strength
         std::array<float, 4> eye_pos;
         std::array<float, 4> cloud_mapping; // xy = map origin, z = height, w = XY scale
     };
@@ -6936,7 +7044,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     sky_ub.params = { std::tan( g_fov_y * 0.5f ), g_aspect, cloudiness,
                       nv_tint ? 1.0f : 0.0f
                     };
-    sky_ub.wind = { wind_dir.x * drift_scale, wind_dir.y * drift_scale, storminess, 0.0f };
+    sky_ub.wind = { wind_dir.x * drift_scale, wind_dir.y * drift_scale, storminess, fog_strength };
     sky_ub.eye_pos = { eye.x, eye.y, eye.z, 0.0f };
     sky_ub.cloud_mapping = { static_cast<float>( center.x() ), static_cast<float>( center.y() ),
                              cloud_height, cloud_scale
@@ -6953,8 +7061,9 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> wind;
         std::array<float, 4> cloud_mapping;
         std::array<float, 4> water_params;
+        std::array<float, 4> weather_params;
     };
-    static_assert( sizeof( water_uniforms ) == 13 * 16, "water fragment UBO must match std140" );
+    static_assert( sizeof( water_uniforms ) == 14 * 16, "water fragment UBO must match std140" );
     water_uniforms water_ub{};
     water_ub.view_proj = mvp;
     water_ub.eye_pos = sky_ub.eye_pos;
@@ -6971,6 +7080,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::clamp( 0.035f + weather.windspeed * 0.0025f, 0.035f, 0.09f ),
         36.0f, 0.12f
     };
+    water_ub.weather_params = { fog_strength, 0.0f, 0.0f, 0.0f };
 
     // fragment-shader uniforms: the camera->player occlusion mask. walls and
     // roofs on the eye-to-player segment fade out with a soft dithered edge so
@@ -7051,7 +7161,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     frag_ub.atmosphere_wind = { wind_dir.x * drift_scale, wind_dir.y * drift_scale,
                                 cloudiness, fog_strength
                               };
-    frag_ub.atmosphere_params = { cloud_height, cloud_scale, 60.0f, camera_far * 0.9f };
+    frag_ub.atmosphere_params = { cloud_height, cloud_scale, fog_start, fog_end };
     frag_ub.atmosphere_origin = { static_cast<float>( center.x() ), static_cast<float>( center.y() ),
                                   storminess, 0.0f
                                 };
@@ -7073,6 +7183,33 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     gtao_ub.proj_params = { std::tan( g_fov_y * 0.5f ), g_aspect, camera_near, camera_far };
     gtao_ub.screen_params = { static_cast<float>( w ), static_cast<float>( h ), 0.0f, 0.0f };
     gtao_ub.ao_params = { 2.4f, 4.0f, 1.35f, 0.0f };
+
+    struct weather_post_uniforms {
+        std::array<float, 4> cam_right;
+        std::array<float, 4> cam_up;
+        std::array<float, 4> cam_forward;
+        std::array<float, 4> eye_pos; // w = player position is exposed
+        std::array<float, 4> ray_params;
+        std::array<float, 4> precipitation; // x = rain, y = snow, z = seconds, w = enabled
+        std::array<float, 4> wind; // xy = direction, z = normalized speed, w = daylight
+        std::array<float, 4> mask_mapping; // xy = map origin, z = level height
+    };
+    static_assert( sizeof( weather_post_uniforms ) == 8 * 16,
+                   "weather post fragment UBO must match std140" );
+    weather_post_uniforms weather_post_ub{};
+    weather_post_ub.cam_right = sky_ub.cam_right;
+    weather_post_ub.cam_up = sky_ub.cam_up;
+    weather_post_ub.cam_forward = sky_ub.cam_forward;
+    const bool player_exposed = center.z() >= 0 && here.inbounds( upos ) && !here.is_roofed( upos );
+    weather_post_ub.eye_pos = { eye.x, eye.y, eye.z, player_exposed ? 1.0f : 0.0f };
+    weather_post_ub.ray_params = water_ub.ray_params;
+    weather_post_ub.precipitation = { weather_state.rain, weather_state.snow, now_seconds, 0.0f };
+    weather_post_ub.wind = { wind_dir.x, wind_dir.y,
+                             std::clamp( weather.windspeed / 20.0f, 0.0f, 1.0f ), daylight
+                           };
+    weather_post_ub.mask_mapping = { static_cast<float>( center.x() ), static_cast<float>( center.y() ),
+                                     LEVEL_HEIGHT, 0.0f
+                                   };
 
     // fallback clear color when the sky pass is unavailable
     const SDL_FColor sky{ 0.02f + 0.35f * daylight, 0.02f + 0.45f * daylight,
@@ -7105,6 +7242,10 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
 
     const bool light_hue_ready = upload_light_hue( cmd, slot, here );
     frag_ub.light_params[0] = light_hue_ready && get_option<bool>( "COLORED_LIGHTING" ) ? 1.0f : 0.0f;
+    const float precipitation_strength = weather_state.rain + weather_state.snow;
+    const bool weather_mask_ready = !nv_tint && center.z() >= 0 && precipitation_strength > 0.001f &&
+                                    upload_weather_mask( cmd, slot, here, center.z(), now_ticks );
+    weather_post_ub.precipitation[3] = weather_mask_ready ? 1.0f : 0.0f;
     const bool shadows_ready = caster_frustum && slot.shadow_tex && g_ctx.shadow_pipeline &&
                                g_ctx.shadow_sampler;
     frag_ub.shadow_params[0] = shadows_ready ? 1.0f : 0.0f;
@@ -7522,12 +7663,18 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     SDL_GPURenderPass *post_pass = SDL_BeginGPURenderPass( cmd, &post_target, 1, nullptr );
     SDL_BindGPUGraphicsPipeline( post_pass,
                                  bloom_ready ? g_ctx.post_bloom_pipeline : g_ctx.post_pipeline );
-    SDL_GPUTextureSamplerBinding post_samplers[2]{};
+    SDL_GPUTextureSamplerBinding post_samplers[4]{};
     post_samplers[0].texture = water_ready ? slot.water_tex : slot.hdr_tex;
     post_samplers[0].sampler = g_ctx.sampler;
-    post_samplers[1].texture = slot.bloom_tex[bloom_source];
+    post_samplers[1].texture = bloom_ready ? slot.bloom_tex[bloom_source] : post_samplers[0].texture;
     post_samplers[1].sampler = g_ctx.linear_sampler;
-    SDL_BindGPUFragmentSamplers( post_pass, 0, post_samplers, bloom_ready ? 2 : 1 );
+    post_samplers[2].texture = slot.depth_tex;
+    post_samplers[2].sampler = g_ctx.sampler;
+    post_samplers[3].texture = slot.weather_mask_tex ? slot.weather_mask_tex :
+                               ( slot.light_tex ? slot.light_tex : slot.depth_tex );
+    post_samplers[3].sampler = g_ctx.sampler;
+    SDL_BindGPUFragmentSamplers( post_pass, 0, post_samplers, 4 );
+    SDL_PushGPUFragmentUniformData( cmd, 0, &weather_post_ub, sizeof( weather_post_ub ) );
     SDL_DrawGPUPrimitives( post_pass, 3, 1, 0, 0 );
     SDL_EndGPURenderPass( post_pass );
 
