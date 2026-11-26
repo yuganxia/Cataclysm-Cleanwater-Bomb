@@ -6836,20 +6836,59 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     g_profile.segments = segments.size();
     g_profile.upload_bytes = inst.size() * sizeof( float );
 
-    // weather-driven cloud cover: how much of the clear-sky sunlight the
-    // current weather blocks. at night the ratio is meaningless; the sky is
-    // dark either way, so any mid value is fine
     const weather_manager &weather = get_weather_const();
-    const float clear_sun = incident_sunlight( WEATHER_CLEAR );
-    const float cur_sun = incident_sunlight( weather.weather_id );
-    const float cloudiness = clear_sun > 1e-3f
-                             ? std::clamp( 1.0f - cur_sun / clear_sun, 0.0f, 1.0f ) : 0.5f;
-    // cloud drift in noise space, following the wind
-    const rl_vec2d wind_dir = convert_wind_to_coord( weather.winddirection );
-    const float drift_scale = weather.windspeed * 0.01f * ( SDL_GetTicks() / 1000.0f );
+    const float solar_occlusion = std::clamp( 1.0f - weather.weather_id->sun_multiplier,
+                                  0.0f, 1.0f );
+    const float ambient_occlusion = std::clamp( 1.0f - weather.weather_id->light_multiplier,
+                                    0.0f, 1.0f );
     const float precipitation = std::clamp(
                                     static_cast<float>( static_cast<int>( weather.weather_id->precip ) ) / 3.0f,
                                     0.0f, 1.0f );
+    float precipitation_cover = 0.0f;
+    switch( weather.weather_id->precip ) {
+        case precip_class::very_light:
+            precipitation_cover = 0.45f;
+            break;
+        case precip_class::light:
+            precipitation_cover = 0.68f;
+            break;
+        case precip_class::heavy:
+            precipitation_cover = 0.88f;
+            break;
+        default:
+            break;
+    }
+    const float target_cover = std::clamp(
+                                   std::max( std::max( solar_occlusion, ambient_occlusion * 0.85f ),
+                                           precipitation_cover ), 0.0f, 1.0f );
+    const float target_storm = std::clamp( ( target_cover - 0.5f ) * 0.9f +
+                                           precipitation * 0.45f, 0.0f, 1.0f );
+    struct cloud_visual_state {
+        float cover = 0.0f;
+        float storm = 0.0f;
+        Uint64 last_ticks = 0;
+        bool initialized = false;
+    };
+    static cloud_visual_state cloud_state;
+    const Uint64 now_ticks = SDL_GetTicks();
+    const float now_seconds = static_cast<float>( now_ticks / 1000.0 );
+    if( !cloud_state.initialized ) {
+        cloud_state.cover = target_cover;
+        cloud_state.storm = target_storm;
+        cloud_state.initialized = true;
+    } else {
+        const float dt = std::clamp( static_cast<float>( now_ticks - cloud_state.last_ticks ) / 1000.0f,
+                                     0.0f, 0.25f );
+        const float blend = 1.0f - std::exp( -dt * 2.4f );
+        cloud_state.cover += ( target_cover - cloud_state.cover ) * blend;
+        cloud_state.storm += ( target_storm - cloud_state.storm ) * blend;
+    }
+    cloud_state.last_ticks = now_ticks;
+    const float cloudiness = cloud_state.cover;
+    const float storminess = cloud_state.storm;
+    // cloud drift in noise space, following the wind
+    const rl_vec2d wind_dir = convert_wind_to_coord( weather.winddirection );
+    const float drift_scale = weather.windspeed * 0.01f * now_seconds;
     constexpr float cloud_height = 160.0f;
     constexpr float cloud_scale = 0.035f;
     const float fog_strength = center.z() < 0 ? 0.0f
@@ -6883,7 +6922,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> sun_dir; // xyz = toward sun, w = daylight
         std::array<float, 4> params;  // x = tan(fov/2), y = aspect, z = cloudiness,
         // w = 1 in a night vision frame
-        std::array<float, 4> wind;    // xy = cloud drift offset
+        std::array<float, 4> wind;    // xy = cloud drift offset, z = storminess
         std::array<float, 4> eye_pos;
         std::array<float, 4> cloud_mapping; // xy = map origin, z = height, w = XY scale
     };
@@ -6897,7 +6936,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     sky_ub.params = { std::tan( g_fov_y * 0.5f ), g_aspect, cloudiness,
                       nv_tint ? 1.0f : 0.0f
                     };
-    sky_ub.wind = { wind_dir.x * drift_scale, wind_dir.y * drift_scale, 0.0f, 0.0f };
+    sky_ub.wind = { wind_dir.x * drift_scale, wind_dir.y * drift_scale, storminess, 0.0f };
     sky_ub.eye_pos = { eye.x, eye.y, eye.z, 0.0f };
     sky_ub.cloud_mapping = { static_cast<float>( center.x() ), static_cast<float>( center.y() ),
                              cloud_height, cloud_scale
@@ -6925,10 +6964,10 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     water_ub.sun_dir = sky_ub.sun_dir;
     water_ub.sun_dir[3] = center.z() < 0 ? 0.0f : daylight;
     water_ub.ray_params = { std::tan( g_fov_y * 0.5f ), g_aspect, camera_near, camera_far };
-    water_ub.wind = { sky_ub.wind[0], sky_ub.wind[1], cloudiness, 0.0f };
+    water_ub.wind = { sky_ub.wind[0], sky_ub.wind[1], cloudiness, storminess };
     water_ub.cloud_mapping = sky_ub.cloud_mapping;
     water_ub.water_params = {
-        static_cast<float>( SDL_GetTicks() / 1000.0 ),
+        now_seconds,
         std::clamp( 0.035f + weather.windspeed * 0.0025f, 0.035f, 0.09f ),
         36.0f, 0.12f
     };
@@ -7014,7 +7053,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
                               };
     frag_ub.atmosphere_params = { cloud_height, cloud_scale, 60.0f, camera_far * 0.9f };
     frag_ub.atmosphere_origin = { static_cast<float>( center.x() ), static_cast<float>( center.y() ),
-                                  0.0f, 0.0f
+                                  storminess, 0.0f
                                 };
     frag_ub.ao_params = { 0.0f, 0.7f, 60.0f, 140.0f };
 

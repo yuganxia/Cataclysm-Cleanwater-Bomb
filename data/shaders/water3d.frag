@@ -15,7 +15,7 @@ layout(set = 3, binding = 0) uniform WaterUBO {
     vec4 cam_forward;
     vec4 sun_dir;       // xyz = direction toward sun, w = daylight
     vec4 ray_params;    // x = tan(fov/2), y = aspect, z = near, w = far
-    vec4 wind;          // xy = cloud drift in noise space
+    vec4 wind;          // xy = cloud drift, z = cloudiness, w = storminess
     vec4 cloud_mapping; // xy = map origin, z = cloud height, w = cloud XY scale
     vec4 water_params;  // x = seconds, y = wave slope, z = max ray distance, w = depth thickness
 };
@@ -123,7 +123,7 @@ void main()
     vec3 reflected_direction = normalize( reflect( view_direction, normal ) );
     vec3 reflected_sun;
     vec3 sky = sky3d_radiance( reflected_direction, eye_pos.xyz, sun_dir.xyz,
-                               clamp( sun_dir.w, 0.0, 1.0 ), wind.z, wind.xy,
+                               clamp( sun_dir.w, 0.0, 1.0 ), wind.z, wind.w, wind.xy,
                                cloud_mapping.xy, cloud_mapping.z, cloud_mapping.w,
                                reflected_sun );
 

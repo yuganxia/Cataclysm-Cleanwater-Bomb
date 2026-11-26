@@ -36,7 +36,7 @@ layout(set = 3, binding = 0) uniform FragUBO {
     vec4 atmosphere_sun; // xyz = direction toward sun, w = daylight
     vec4 atmosphere_wind; // xy = cloud drift, z = cloudiness, w = fog strength
     vec4 atmosphere_params; // x = cloud height, y = cloud scale, z = fog start, w = fog end
-    vec4 atmosphere_origin; // xy = view center in map coordinates
+    vec4 atmosphere_origin; // xy = view center in map coordinates, z = storminess
     vec4 ao_params;     // x = enabled, y = strength, z = fade start, w = fade end
 };
 
@@ -170,15 +170,30 @@ float cloud_sun_visibility()
     if( v_sun <= 0.0 || atmosphere_sun.z <= 0.05 || atmosphere_sun.w <= 0.05 ) {
         return 1.0;
     }
-    float cloud_t = ( atmosphere_params.x - v_world.z ) / atmosphere_sun.z;
-    if( cloud_t < 0.0 ) {
-        return 1.0;
+    float low_coverage = 0.0;
+    if( atmosphere_params.x > v_world.z ) {
+        float cloud_t = ( atmosphere_params.x - v_world.z ) / atmosphere_sun.z;
+        vec2 cloud_xy = v_world.xy + atmosphere_sun.xy * cloud_t;
+        vec2 coordinates = atmosphere_cloud_coordinates(
+                               cloud_xy, atmosphere_origin.xy,
+                               atmosphere_wind.xy, atmosphere_params.y );
+        low_coverage = atmosphere_low_cloud_coverage(
+                           coordinates, atmosphere_wind.z, atmosphere_origin.z );
     }
-    vec2 cloud_xy = v_world.xy + atmosphere_sun.xy * cloud_t;
-    vec2 coordinates = atmosphere_cloud_coordinates( cloud_xy, atmosphere_origin.xy,
-                       atmosphere_wind.xy, atmosphere_params.y );
-    float coverage = atmosphere_cloud_coverage( coordinates, atmosphere_wind.z );
-    return 1.0 - 0.65 * coverage;
+    float high_coverage = 0.0;
+    float high_height = atmosphere_params.x * 1.85;
+    if( high_height > v_world.z ) {
+        float cloud_t = ( high_height - v_world.z ) / atmosphere_sun.z;
+        vec2 cloud_xy = v_world.xy + atmosphere_sun.xy * cloud_t;
+        vec2 coordinates = atmosphere_high_cloud_coordinates(
+                               cloud_xy, atmosphere_origin.xy,
+                               atmosphere_wind.xy, atmosphere_params.y );
+        high_coverage = atmosphere_high_cloud_coverage(
+                            coordinates, atmosphere_wind.z, atmosphere_origin.z );
+    }
+    float occlusion = low_coverage * ( 0.55 + 0.20 * atmosphere_origin.z ) +
+                      high_coverage * 0.22;
+    return 1.0 - min( occlusion, 0.85 );
 }
 
 float ambient_occlusion()
