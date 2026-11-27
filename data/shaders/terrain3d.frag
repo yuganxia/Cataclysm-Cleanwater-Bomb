@@ -420,19 +420,27 @@ void main()
     vec3 emission = v_emission.rgb *
                     ( textured ? color3d_srgb_to_linear( sampled.rgb ) : vec3( 1.0 ) );
     // A transmitting opening is a source of visible sun spill, not merely a
-    // surface that happens to face the sun. Keep some albedo in the portal core
-    // so different glass and door sprites retain their own color and detail.
+    // surface that happens to face the sun. The high-energy source is kept out
+    // of the visible surface so the glass and frame textures remain readable.
     bool sun_portal = ( flags & 131072 ) != 0 && bounce_params.x > 0.5;
     float portal_fade = 1.0 - smoothstep( lighting_params.z, lighting_params.w,
                                           length( v_world - eye_pos.xyz ) );
+    vec3 portal_emission = vec3( 0.0 );
     if( sun_portal ) {
         vec3 portal_tint = mix( vec3( 1.0 ), albedo, 0.35 );
         float portal_day = clamp( atmosphere_sun.w, 0.0, 1.0 ) * cloud * portal_fade;
-        emission += sunlight_color.rgb * sunlight_color.w * bounce_params.z *
-                    portal_day * portal_tint;
+        portal_emission = sunlight_color.rgb * sunlight_color.w * bounce_params.z *
+                          portal_day * portal_tint;
     }
     vec3 lit = albedo * ( ambient + direct ) + emission;
+    if( sun_portal ) {
+        // Match an ordinary fully sunlit surface instead of adding the halo's
+        // HDR energy to the window itself. The separate emissive target keeps
+        // the surrounding spill at its existing strength.
+        vec3 portal_direct = sunlight_color.rgb * sunlight_color.w * cloud * portal_fade;
+        lit = albedo * ( ambient + portal_direct ) + emission;
+    }
     out_color = vec4( apply_air_perspective( lit ), composite_alpha );
     float material_alpha = sun_portal ? -2.0 : ( ( flags & 16384 ) != 0 ? 1.0 : 0.0 );
-    out_emissive = vec4( emission, material_alpha );
+    out_emissive = vec4( emission + portal_emission, material_alpha );
 }
