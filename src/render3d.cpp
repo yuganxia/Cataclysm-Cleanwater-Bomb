@@ -1829,7 +1829,7 @@ bool probe( SDL_Renderer *renderer )
     SDL_ReleaseGPUShader( device, vs );
     SDL_ReleaseGPUShader( device, fs );
 
-    SDL_GPUShader *shadow_vs = load_shader( device, "terrain3d.vert", SDL_GPU_SHADERSTAGE_VERTEX, 1 );
+    SDL_GPUShader *shadow_vs = load_shader( device, "terrain3d_shadow.vert", SDL_GPU_SHADERSTAGE_VERTEX, 1 );
     SDL_GPUShader *shadow_fs = load_shader( device, "terrain3d_shadow.frag",
                                             SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 1 );
     if( shadow_vs && shadow_fs ) {
@@ -1844,7 +1844,9 @@ bool probe( SDL_Renderer *renderer )
         shpi.target_info.has_depth_stencil_target = true;
         g_ctx.shadow_pipeline = SDL_CreateGPUGraphicsPipeline( device, &shpi );
         if( !g_ctx.shadow_pipeline ) {
-            write_status( "shadow pipeline unavailable; sun shadows disabled" );
+            const std::string error = SDL_GetError();
+            DebugLog( D_ERROR, DC_ALL ) << "render3d: shadow pipeline creation failed: " << error;
+            write_status( "shadow pipeline unavailable; sun shadows disabled: " + error );
         }
     } else {
         write_status( "shadow shaders missing; sun shadows disabled" );
@@ -2790,6 +2792,7 @@ constexpr int CREATURE_HOSTILE_FLAG = 1 << 11;
 constexpr int CREATURE_NEUTRAL_FLAG = 1 << 12;
 constexpr int CREATURE_FRIENDLY_FLAG = 1 << 13;
 constexpr int WATER_FLAG = 1 << 14;
+constexpr int SHADOW_ONLY_FLAG = 1 << 15;
 
 std::array<float, 4> emission_from_light( const float emitted,
         const light_color_rgb &light_color = {} )
@@ -2814,7 +2817,8 @@ void push_instance( instance_sink out, const float dx, const float dy,
                     const bool ghost = false, const float saturation = 1.0f,
                     const bool memory = false, const bool soft_alpha = false,
                     const bool edge_skirt = false, const int creature_relation = 0,
-                    const std::array<float, 4> &emission = {}, const bool water = false )
+                    const std::array<float, 4> &emission = {}, const bool water = false,
+                    const bool shadow_only = false )
 {
     out.data[0] = dx;
     out.data[1] = dy;
@@ -2847,12 +2851,14 @@ void push_instance( instance_sink out, const float dx, const float dy,
     // bit10: same-level wall — solid lower third, dithered fade, transparent top
     // bit11-13: hostile / neutral / friendly creature outline for the composite
     // bit14: water top surface, exported through the emissive target's alpha
+    // bit15: shadow-only geometry, hidden from color and camera-depth passes
     // pad: side-strip v, or the run direction for MODE_LINEQUAD (0 = E-W)
     out.data[14] = ( spr.atlas ? 1.0f : 0.0f ) + ( no_discard ? 2.0f : 0.0f ) +
                    static_cast<float>( ( rota4 & 3 ) << 2 ) + ( side_strip ? 16.0f : 0.0f ) +
                    ( ghost ? 32.0f : 0.0f ) + ( memory ? 64.0f : 0.0f ) +
                    ( soft_alpha ? 128.0f : 0.0f ) + ( edge_skirt ? 256.0f : 0.0f ) +
-                   static_cast<float>( creature_relation ) + ( water ? WATER_FLAG : 0 );
+                   static_cast<float>( creature_relation ) + ( water ? WATER_FLAG : 0 ) +
+                   ( shadow_only ? SHADOW_ONLY_FLAG : 0 );
     out.data[15] = pad_value >= 0.0f ? pad_value
                    : ( side_strip ? spr.v1 - 0.02f * ( spr.v1 - spr.v0 ) : 0.0f );
     out.data[16] = emission[0];
@@ -5411,6 +5417,22 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                 }
                                 vdrew = true;
                             }
+                            // The near-field skin replaces the shell on screen,
+                            // not in the light.  A compact voxel proxy preserves
+                            // the vehicle's directional shadow without adding
+                            // hidden shell pixels or camera-depth occluders.
+                            if( near_hide && count < MAX_DRAW_INSTANCES ) {
+                                const sprite_info &shadow_spr = vl.fg_tex ? vl.fg : vl.bg;
+                                std::vector<float> &v = bucket_for( MODE_BOX,
+                                                                    shadow_spr.atlas );
+                                push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
+                                               wz + VEH_BODY_BASE, 1.0f, 1.0f,
+                                               VEH_ROOF_Z - VEH_BODY_BASE, shadow_spr,
+                                               1.0f, 1.0f, 1.0f, true, 0, false, -1.0f,
+                                               false, 1.0f, false, false, false, 0,
+                                               vehicle_emission, false, true );
+                                ++count;
+                            }
                             if( !vl.fg_tex && !vl.bg_tex ) {
                                 // no sprite: the ASCII fallback
                                 // draw_from_id_string_internal uses — the variant's
@@ -7516,7 +7538,9 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         SDL_GPUBufferBinding shadow_inst_bind{};
         shadow_inst_bind.buffer = slot.instance_vb;
         for( const draw_segment &seg : segments ) {
-            if( seg.mode == MODE_FLATQUAD_DECAL || seg.mode == MODE_LINEQUAD_DECAL ) {
+            // Zero-height ground decals have no useful silhouette.  Vertical
+            // vehicle panels remain casters and use their base linequad mode.
+            if( seg.mode == MODE_FLATQUAD_DECAL ) {
                 continue;
             }
             SDL_GPUBufferBinding geom_bind{};
@@ -7528,7 +7552,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
                 geom_bind.buffer = g_ctx.flatquad_vb;
                 verts_per_instance = 6;
             } else if( seg.mode == MODE_BILLBOARD || seg.mode == MODE_BILLBOARD_SNAP ||
-                       seg.mode == MODE_LINEQUAD ) {
+                       seg.mode == MODE_LINEQUAD || seg.mode == MODE_LINEQUAD_DECAL ) {
                 geom_bind.buffer = g_ctx.quad_vb;
                 verts_per_instance = 6;
             } else {
@@ -7541,7 +7565,9 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
             sampler_bind.texture = atlas_gpu ? atlas_gpu : g_ctx.fallback_tex;
             sampler_bind.sampler = g_ctx.sampler;
             SDL_BindGPUFragmentSamplers( shadow_pass, 0, &sampler_bind, 1 );
-            shadow_uniforms.params = { static_cast<float>( seg.mode ), 0.0f, 0.0f, 0.0f };
+            const int shadow_mode = seg.mode == MODE_FLATQUAD_DECAL ? MODE_FLATQUAD :
+                                    seg.mode == MODE_LINEQUAD_DECAL ? MODE_LINEQUAD : seg.mode;
+            shadow_uniforms.params = { static_cast<float>( shadow_mode ), 0.0f, 0.0f, 0.0f };
             SDL_PushGPUVertexUniformData( cmd, 0, &shadow_uniforms, sizeof( shadow_uniforms ) );
             SDL_DrawGPUPrimitives( shadow_pass, verts_per_instance, seg.num_instances, 0, seg.first_instance );
         }

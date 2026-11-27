@@ -244,6 +244,11 @@ void main()
 {
     out_emissive = vec4( 0.0 );
     int flags = int( v_flags + 0.5 );
+    // Vehicle shells can remain visible to the sun while their near-field 2D
+    // skin replaces them on screen.  They must not affect color or camera depth.
+    if( ( flags & 32768 ) != 0 ) {
+        discard;
+    }
     const bool same_level_wall = ( flags & 1024 ) != 0;
     const bool mask_candidate = mask_params.w > 0.5 && !same_level_wall &&
                                 v_world.z > mask_params.z + 0.15;
