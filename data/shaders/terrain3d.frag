@@ -38,6 +38,8 @@ layout(set = 3, binding = 0) uniform FragUBO {
     vec4 atmosphere_params; // x = cloud height, y = cloud scale, z = fog start, w = fog end
     vec4 atmosphere_origin; // xy = view center in map coordinates, z = storminess
     vec4 ao_params;     // x = enabled, y = strength, z = fade start, w = fade end
+    vec4 sunlight_color; // rgb = direct sun tint, w = direct-light gain
+    vec4 ambient_color;  // rgb = ambient tint, w = ambient-light gain
 };
 
 layout(location = 0) in vec4 v_color;
@@ -355,10 +357,12 @@ void main()
     // tile light's saturation (1 = full color, 0 = grayscale)
     float gray = ( rgb.r + rgb.g + rgb.b ) / 3.0;
     rgb = mix( vec3( gray ), rgb, v_color.a );
-    float direct_sun = v_sun * sun_visibility() * cloud_sun_visibility();
-    float shade = ( v_shade - v_sun ) * ambient_occlusion() + direct_sun;
+    float direct_sun = v_sun * sunlight_color.w * sun_visibility() * cloud_sun_visibility();
+    vec3 ambient = ambient_color.rgb *
+                   ( ( v_shade - v_sun ) * ambient_color.w * ambient_occlusion() );
+    vec3 direct = sunlight_color.rgb * direct_sun;
     vec3 emission = v_emission.rgb * ( textured ? sampled.rgb : vec3( 1.0 ) );
-    vec3 lit = apply_air_perspective( rgb * shade ) + emission;
+    vec3 lit = apply_air_perspective( rgb * ( ambient + direct ) ) + emission;
     out_color = vec4( lit, composite_alpha );
     out_emissive = vec4( emission, ( flags & 16384 ) != 0 ? 1.0 : 0.0 );
 }

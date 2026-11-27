@@ -154,9 +154,11 @@ constexpr int LIGHT_TEXTURE_WIDTH = MAPSIZE_X;
 constexpr int LIGHT_TEXTURE_HEIGHT = MAPSIZE_Y * OVERMAP_LAYERS;
 constexpr size_t LIGHT_LAYER_BYTES = static_cast<size_t>( MAPSIZE_X ) * MAPSIZE_Y *
                                      sizeof( smooth_lighting::lightmap_texel );
-constexpr int WEATHER_MASK_LAYERS = 3;
+constexpr int WEATHER_MASK_LAYERS = 7;
 constexpr int WEATHER_MASK_HEIGHT = MAPSIZE_Y * WEATHER_MASK_LAYERS;
 constexpr size_t WEATHER_MASK_BYTES = static_cast<size_t>( MAPSIZE_X ) * WEATHER_MASK_HEIGHT;
+constexpr int RAIN_PARTICLE_COUNT = 1800;
+constexpr int SNOW_PARTICLE_COUNT = 700;
 constexpr float FLOOR_THICK = 0.1f;
 // wall tops end inside the next level's floor slab: high enough to close the
 // seam, but below the slab top so they cannot replace the upper floor surface
@@ -676,6 +678,7 @@ struct context {
     SDL_GPUGraphicsPipeline *bloom_extract_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *bloom_blur_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *water_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline *precipitation_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *prepass_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *gtao_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *ao_blur_pipeline = nullptr;
@@ -1189,6 +1192,10 @@ void context::teardown()
             SDL_ReleaseGPUGraphicsPipeline( device, water_pipeline );
             water_pipeline = nullptr;
         }
+        if( precipitation_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, precipitation_pipeline );
+            precipitation_pipeline = nullptr;
+        }
         if( prepass_pipeline ) {
             SDL_ReleaseGPUGraphicsPipeline( device, prepass_pipeline );
             prepass_pipeline = nullptr;
@@ -1500,7 +1507,7 @@ bool upload_weather_mask( SDL_GPUCommandBuffer *cmd, frame_slot &slot, map &here
         return false;
     }
     for( int layer = 0; layer < WEATHER_MASK_LAYERS; ++layer ) {
-        const int z = center_z + layer - 1;
+        const int z = center_z + layer - WEATHER_MASK_LAYERS / 2;
         for( int y = 0; y < MAPSIZE_Y; ++y ) {
             for( int x = 0; x < MAPSIZE_X; ++x ) {
                 const tripoint_bub_ms p( x, y, z );
@@ -1863,7 +1870,7 @@ bool probe( SDL_Renderer *renderer )
     }
 
     SDL_GPUShader *post_vs = load_shader( device, "post3d.vert", SDL_GPU_SHADERSTAGE_VERTEX, 0 );
-    SDL_GPUShader *post_fs = load_shader( device, "tonemap3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 4 );
+    SDL_GPUShader *post_fs = load_shader( device, "tonemap3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 2 );
     SDL_GPUShader *gtao_fs = load_shader( device, "gtao3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
     SDL_GPUShader *ao_blur_fs = load_shader( device, "gtao3d_blur.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 0,
                                  1 );
@@ -1872,9 +1879,13 @@ bool probe( SDL_Renderer *renderer )
     SDL_GPUShader *bloom_blur_fs = load_shader( device, "bloom3d_blur.frag",
                                     SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
     SDL_GPUShader *post_bloom_fs = load_shader( device, "tonemap3d_bloom.frag",
-                                   SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 4 );
+                                   SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 2 );
     SDL_GPUShader *water_fs = load_shader( device, "water3d.frag",
                                            SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 3 );
+    SDL_GPUShader *precipitation_vs = load_shader( device, "precipitation3d.vert",
+                                      SDL_GPU_SHADERSTAGE_VERTEX, 1 );
+    SDL_GPUShader *precipitation_fs = load_shader( device, "precipitation3d.frag",
+                                      SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
     SDL_GPUGraphicsPipelineCreateInfo ppi{};
     ppi.vertex_shader = post_vs;
     ppi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
@@ -1918,6 +1929,34 @@ bool probe( SDL_Renderer *renderer )
         pcolor_desc.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
         g_ctx.water_pipeline = SDL_CreateGPUGraphicsPipeline( device, &ppi );
     }
+    if( precipitation_vs && precipitation_fs ) {
+        SDL_GPUGraphicsPipelineCreateInfo precipitation_pi{};
+        precipitation_pi.vertex_shader = precipitation_vs;
+        precipitation_pi.fragment_shader = precipitation_fs;
+        precipitation_pi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+        precipitation_pi.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+        precipitation_pi.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+        precipitation_pi.depth_stencil_state.enable_depth_test = true;
+        precipitation_pi.depth_stencil_state.enable_depth_write = false;
+        precipitation_pi.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
+        SDL_GPUColorTargetDescription precipitation_color{};
+        precipitation_color.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+        precipitation_color.blend_state.enable_blend = true;
+        precipitation_color.blend_state.src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA;
+        precipitation_color.blend_state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+        precipitation_color.blend_state.color_blend_op = SDL_GPU_BLENDOP_ADD;
+        precipitation_color.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ZERO;
+        precipitation_color.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+        precipitation_color.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+        precipitation_color.blend_state.enable_color_write_mask = true;
+        precipitation_color.blend_state.color_write_mask = SDL_GPU_COLORCOMPONENT_R |
+                SDL_GPU_COLORCOMPONENT_G | SDL_GPU_COLORCOMPONENT_B;
+        precipitation_pi.target_info.num_color_targets = 1;
+        precipitation_pi.target_info.color_target_descriptions = &precipitation_color;
+        precipitation_pi.target_info.has_depth_stencil_target = true;
+        precipitation_pi.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+        g_ctx.precipitation_pipeline = SDL_CreateGPUGraphicsPipeline( device, &precipitation_pi );
+    }
     if( post_vs ) {
         SDL_ReleaseGPUShader( device, post_vs );
     }
@@ -1942,6 +1981,12 @@ bool probe( SDL_Renderer *renderer )
     if( water_fs ) {
         SDL_ReleaseGPUShader( device, water_fs );
     }
+    if( precipitation_vs ) {
+        SDL_ReleaseGPUShader( device, precipitation_vs );
+    }
+    if( precipitation_fs ) {
+        SDL_ReleaseGPUShader( device, precipitation_fs );
+    }
     if( !g_ctx.post_pipeline ) {
         write_status( "unavailable: HDR post pipeline creation failed" );
         g_ctx.teardown();
@@ -1956,6 +2001,9 @@ bool probe( SDL_Renderer *renderer )
     }
     if( !g_ctx.water_pipeline ) {
         write_status( "water pipeline unavailable; water reflections disabled" );
+    }
+    if( !g_ctx.precipitation_pipeline ) {
+        write_status( "precipitation pipeline unavailable; precipitation disabled" );
     }
 
     // Optional final-composite tilt-shift. Missing artifacts fall back to the
@@ -6956,7 +7004,10 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     const float animated_precipitation = precipitation_animation ? precipitation : 0.0f;
     const float target_rain = weather.weather_id->rains ? animated_precipitation : 0.0f;
     const float target_snow = weather.weather_id->rains ? 0.0f : animated_precipitation;
-    const float visibility_loss = std::clamp( 1.0f - weather.weather_id->sight_penalty, 0.0f, 1.0f );
+    const float sight_penalty = weather.weather_id->sight_penalty;
+    const float visibility_loss = sight_penalty > 1.0f
+                                  ? std::clamp( 1.0f - 1.0f / sight_penalty, 0.0f, 1.0f )
+                                  : 0.0f;
     const float target_fog = center.z() < 0 ? 0.0f
                              : std::clamp( 0.20f + 0.12f * target_cover + 0.10f * precipitation +
                                            0.62f * visibility_loss, 0.0f, 0.88f );
@@ -7010,7 +7061,10 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> cam_up;
         std::array<float, 4> params; // x = draw_mode
         std::array<float, 4> sun_dir; // xyz = toward sun, w = sun is up
+        std::array<float, 4> water_vertex; // xy = map origin, z = seconds, w = height amplitude
+        std::array<float, 4> water_flow; // xy = world wind direction, z = normalized speed
     };
+    static_assert( sizeof( vert_uniforms ) == 10 * 16, "terrain3d vertex UBO must match std140" );
     vert_uniforms uniforms{};
     uniforms.mvp = mvp;
     // physical camera right on the ground plane: cross( up, forward ) with
@@ -7018,6 +7072,12 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     uniforms.cam_right = { -std::sin( g_yaw ), std::cos( g_yaw ), 0.0f, 0.0f };
     uniforms.cam_up = { 0.0f, 0.0f, 1.0f, 0.0f };
     uniforms.sun_dir = { sun_dir.x, sun_dir.y, sun_dir.z, sun_up ? 1.0f : 0.0f };
+    uniforms.water_vertex = { static_cast<float>( center.x() ), static_cast<float>( center.y() ),
+                              now_seconds, 0.0f
+                            };
+    uniforms.water_flow = { wind_dir.x, wind_dir.y,
+                            std::clamp( weather.windspeed / 20.0f, 0.0f, 1.0f ), 0.0f
+                          };
     vert_uniforms shadow_uniforms = uniforms;
     shadow_uniforms.mvp = light_vp;
 
@@ -7062,8 +7122,10 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> cloud_mapping;
         std::array<float, 4> water_params;
         std::array<float, 4> weather_params;
+        std::array<float, 4> flow;
+        std::array<float, 4> sunlight_color;
     };
-    static_assert( sizeof( water_uniforms ) == 14 * 16, "water fragment UBO must match std140" );
+    static_assert( sizeof( water_uniforms ) == 16 * 16, "water fragment UBO must match std140" );
     water_uniforms water_ub{};
     water_ub.view_proj = mvp;
     water_ub.eye_pos = sky_ub.eye_pos;
@@ -7077,10 +7139,11 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     water_ub.cloud_mapping = sky_ub.cloud_mapping;
     water_ub.water_params = {
         now_seconds,
-        std::clamp( 0.035f + weather.windspeed * 0.0025f, 0.035f, 0.09f ),
+        std::clamp( 0.16f + weather.windspeed * 0.006f, 0.16f, 0.32f ),
         36.0f, 0.12f
     };
-    water_ub.weather_params = { fog_strength, 0.0f, 0.0f, 0.0f };
+    water_ub.weather_params = { fog_strength, weather_state.rain, 0.0f, 0.0f };
+    water_ub.flow = uniforms.water_flow;
 
     // fragment-shader uniforms: the camera->player occlusion mask. walls and
     // roofs on the eye-to-player segment fade out with a soft dithered edge so
@@ -7111,8 +7174,10 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> atmosphere_params;
         std::array<float, 4> atmosphere_origin;
         std::array<float, 4> ao_params;
+        std::array<float, 4> sunlight_color;
+        std::array<float, 4> ambient_color;
     };
-    static_assert( sizeof( frag_uniforms ) == 24 * 16, "terrain3d fragment UBO must match std140" );
+    static_assert( sizeof( frag_uniforms ) == 26 * 16, "terrain3d fragment UBO must match std140" );
     frag_uniforms frag_ub{};
     const tripoint_bub_ms upos = get_avatar().pos_bub();
     const float player_gz = ( upos.z() - center.z() ) * LEVEL_HEIGHT;
@@ -7166,6 +7231,16 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
                                   storminess, 0.0f
                                 };
     frag_ub.ao_params = { 0.0f, 0.7f, 60.0f, 140.0f };
+    const float low_sun = sun_up ? std::clamp( 1.0f - sun_alt / 0.65f, 0.0f, 1.0f ) : 0.0f;
+    frag_ub.sunlight_color = sun_up
+                             ? std::array<float, 4> { 1.0f, 0.92f - 0.10f * low_sun,
+                                     0.78f - 0.18f * low_sun, 1.65f
+                                                    }
+                             : std::array<float, 4> { 1.0f, 1.0f, 1.0f, 1.0f };
+    frag_ub.ambient_color = sun_up
+                            ? std::array<float, 4> { 0.80f, 0.88f, 1.0f, 0.78f }
+                            : std::array<float, 4> { 1.0f, 1.0f, 1.0f, 1.0f };
+    water_ub.sunlight_color = frag_ub.sunlight_color;
 
     struct gtao_uniforms {
         std::array<float, 4> cam_right;
@@ -7184,32 +7259,33 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     gtao_ub.screen_params = { static_cast<float>( w ), static_cast<float>( h ), 0.0f, 0.0f };
     gtao_ub.ao_params = { 2.4f, 4.0f, 1.35f, 0.0f };
 
-    struct weather_post_uniforms {
+    struct precipitation_uniforms {
+        mat4 view_proj;
+        std::array<float, 4> eye_pos;
+        std::array<float, 4> volume_center;
+        std::array<float, 4> volume_params;
+        std::array<float, 4> wind;
+        std::array<float, 4> precipitation;
+        std::array<float, 4> mask_mapping;
         std::array<float, 4> cam_right;
         std::array<float, 4> cam_up;
-        std::array<float, 4> cam_forward;
-        std::array<float, 4> eye_pos; // w = player position is exposed
-        std::array<float, 4> ray_params;
-        std::array<float, 4> precipitation; // x = rain, y = snow, z = seconds, w = enabled
-        std::array<float, 4> wind; // xy = direction, z = normalized speed, w = daylight
-        std::array<float, 4> mask_mapping; // xy = map origin, z = level height
     };
-    static_assert( sizeof( weather_post_uniforms ) == 8 * 16,
-                   "weather post fragment UBO must match std140" );
-    weather_post_uniforms weather_post_ub{};
-    weather_post_ub.cam_right = sky_ub.cam_right;
-    weather_post_ub.cam_up = sky_ub.cam_up;
-    weather_post_ub.cam_forward = sky_ub.cam_forward;
-    const bool player_exposed = center.z() >= 0 && here.inbounds( upos ) && !here.is_roofed( upos );
-    weather_post_ub.eye_pos = { eye.x, eye.y, eye.z, player_exposed ? 1.0f : 0.0f };
-    weather_post_ub.ray_params = water_ub.ray_params;
-    weather_post_ub.precipitation = { weather_state.rain, weather_state.snow, now_seconds, 0.0f };
-    weather_post_ub.wind = { wind_dir.x, wind_dir.y,
-                             std::clamp( weather.windspeed / 20.0f, 0.0f, 1.0f ), daylight
-                           };
-    weather_post_ub.mask_mapping = { static_cast<float>( center.x() ), static_cast<float>( center.y() ),
-                                     LEVEL_HEIGHT, 0.0f
-                                   };
+    static_assert( sizeof( precipitation_uniforms ) == 12 * 16,
+                   "precipitation UBO must match std140" );
+    precipitation_uniforms precipitation_ub{};
+    precipitation_ub.view_proj = mvp;
+    precipitation_ub.eye_pos = { eye.x, eye.y, eye.z, 0.0f };
+    precipitation_ub.volume_center = { 0.5f, 0.5f, player_gz, 18.0f };
+    precipitation_ub.volume_params = { -2.0f, 4.4f, g_aspect, 0.0f };
+    precipitation_ub.wind = { wind_dir.x, wind_dir.y,
+                              std::clamp( weather.windspeed / 20.0f, 0.0f, 1.0f ), now_seconds
+                            };
+    precipitation_ub.precipitation = { weather_state.rain, weather_state.snow, 0.0f, daylight };
+    precipitation_ub.mask_mapping = { static_cast<float>( center.x() ), static_cast<float>( center.y() ),
+                                      LEVEL_HEIGHT, static_cast<float>( WEATHER_MASK_LAYERS )
+                                    };
+    precipitation_ub.cam_right = sky_ub.cam_right;
+    precipitation_ub.cam_up = sky_ub.cam_up;
 
     // fallback clear color when the sky pass is unavailable
     const SDL_FColor sky{ 0.02f + 0.35f * daylight, 0.02f + 0.45f * daylight,
@@ -7243,9 +7319,12 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     const bool light_hue_ready = upload_light_hue( cmd, slot, here );
     frag_ub.light_params[0] = light_hue_ready && get_option<bool>( "COLORED_LIGHTING" ) ? 1.0f : 0.0f;
     const float precipitation_strength = weather_state.rain + weather_state.snow;
-    const bool weather_mask_ready = !nv_tint && center.z() >= 0 && precipitation_strength > 0.001f &&
+    const bool precipitation_requested = !nv_tint && center.z() >= 0 &&
+                                         precipitation_strength > 0.001f &&
+                                         slot.depth_tex && g_ctx.precipitation_pipeline;
+    const bool weather_mask_ready = precipitation_requested &&
                                     upload_weather_mask( cmd, slot, here, center.z(), now_ticks );
-    weather_post_ub.precipitation[3] = weather_mask_ready ? 1.0f : 0.0f;
+    const bool precipitation_ready = precipitation_requested && weather_mask_ready;
     const bool shadows_ready = caster_frustum && slot.shadow_tex && g_ctx.shadow_pipeline &&
                                g_ctx.shadow_sampler;
     frag_ub.shadow_params[0] = shadows_ready ? 1.0f : 0.0f;
@@ -7264,6 +7343,10 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
                              slot.depth_tex && g_ctx.water_pipeline &&
                              g_ctx.sampler && g_ctx.linear_sampler;
     const bool mrt_active = bloom_ready || water_ready;
+    uniforms.water_vertex[3] = water_ready
+                               ? std::clamp( 0.035f + weather.windspeed * 0.0015f, 0.035f, 0.065f )
+                               : 0.0f;
+    shadow_uniforms.water_vertex = uniforms.water_vertex;
 
     // upload instance data. A fully culled scene still renders the sky/clear,
     // but must not create a zero-sized transfer buffer or upload.
@@ -7493,8 +7576,8 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     SDL_GPUDepthStencilTargetInfo depth_target{};
     depth_target.texture = slot.depth_tex;
     depth_target.load_op = ao_ready ? SDL_GPU_LOADOP_LOAD : SDL_GPU_LOADOP_CLEAR;
-    depth_target.store_op = g_ctx.sky_pipeline || water_ready ? SDL_GPU_STOREOP_STORE :
-                            SDL_GPU_STOREOP_DONT_CARE;
+    depth_target.store_op = g_ctx.sky_pipeline || water_ready || precipitation_ready ?
+                            SDL_GPU_STOREOP_STORE : SDL_GPU_STOREOP_DONT_CARE;
     depth_target.clear_depth = 1.0f;
 
     SDL_GPURenderPass *pass = SDL_BeginGPURenderPass( cmd, world_targets,
@@ -7579,7 +7662,8 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         SDL_GPUDepthStencilTargetInfo sky_depth{};
         sky_depth.texture = slot.depth_tex;
         sky_depth.load_op = SDL_GPU_LOADOP_LOAD;
-        sky_depth.store_op = water_ready ? SDL_GPU_STOREOP_STORE : SDL_GPU_STOREOP_DONT_CARE;
+        sky_depth.store_op = water_ready || precipitation_ready ? SDL_GPU_STOREOP_STORE :
+                             SDL_GPU_STOREOP_DONT_CARE;
         SDL_GPURenderPass *sky_pass = SDL_BeginGPURenderPass( cmd, sky_targets,
                                       mrt_active ? 2 : 1, &sky_depth );
         SDL_BindGPUGraphicsPipeline( sky_pass,
@@ -7587,6 +7671,38 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         SDL_PushGPUFragmentUniformData( cmd, 0, &sky_ub, sizeof( sky_ub ) );
         SDL_DrawGPUPrimitives( sky_pass, 3, 1, 0, 0 );
         SDL_EndGPURenderPass( sky_pass );
+    }
+
+    if( precipitation_ready ) {
+        SDL_GPUColorTargetInfo precipitation_target{};
+        precipitation_target.texture = slot.hdr_tex;
+        precipitation_target.load_op = SDL_GPU_LOADOP_LOAD;
+        precipitation_target.store_op = SDL_GPU_STOREOP_STORE;
+        SDL_GPUDepthStencilTargetInfo precipitation_depth{};
+        precipitation_depth.texture = slot.depth_tex;
+        precipitation_depth.load_op = SDL_GPU_LOADOP_LOAD;
+        precipitation_depth.store_op = water_ready ? SDL_GPU_STOREOP_STORE : SDL_GPU_STOREOP_DONT_CARE;
+        SDL_GPURenderPass *precipitation_pass = SDL_BeginGPURenderPass( cmd, &precipitation_target, 1,
+                                                &precipitation_depth );
+        SDL_BindGPUGraphicsPipeline( precipitation_pass, g_ctx.precipitation_pipeline );
+        SDL_GPUTextureSamplerBinding mask_sampler{};
+        mask_sampler.texture = slot.weather_mask_tex;
+        mask_sampler.sampler = g_ctx.sampler;
+        SDL_BindGPUFragmentSamplers( precipitation_pass, 0, &mask_sampler, 1 );
+        for( int mode = 0; mode < 2; ++mode ) {
+            const float strength = mode == 0 ? weather_state.rain : weather_state.snow;
+            if( strength <= 0.001f ) {
+                continue;
+            }
+            precipitation_ub.precipitation[2] = static_cast<float>( mode );
+            const int maximum = mode == 0 ? RAIN_PARTICLE_COUNT : SNOW_PARTICLE_COUNT;
+            const int particles = std::max( 1, static_cast<int>( std::ceil(
+                                                maximum * std::clamp( strength, 0.0f, 1.0f ) ) ) );
+            SDL_PushGPUVertexUniformData( cmd, 0, &precipitation_ub, sizeof( precipitation_ub ) );
+            SDL_PushGPUFragmentUniformData( cmd, 0, &precipitation_ub, sizeof( precipitation_ub ) );
+            SDL_DrawGPUPrimitives( precipitation_pass, 6, particles, 0, 0 );
+        }
+        SDL_EndGPURenderPass( precipitation_pass );
     }
 
     if( water_ready ) {
@@ -7663,18 +7779,12 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     SDL_GPURenderPass *post_pass = SDL_BeginGPURenderPass( cmd, &post_target, 1, nullptr );
     SDL_BindGPUGraphicsPipeline( post_pass,
                                  bloom_ready ? g_ctx.post_bloom_pipeline : g_ctx.post_pipeline );
-    SDL_GPUTextureSamplerBinding post_samplers[4]{};
+    SDL_GPUTextureSamplerBinding post_samplers[2]{};
     post_samplers[0].texture = water_ready ? slot.water_tex : slot.hdr_tex;
     post_samplers[0].sampler = g_ctx.sampler;
     post_samplers[1].texture = bloom_ready ? slot.bloom_tex[bloom_source] : post_samplers[0].texture;
     post_samplers[1].sampler = g_ctx.linear_sampler;
-    post_samplers[2].texture = slot.depth_tex;
-    post_samplers[2].sampler = g_ctx.sampler;
-    post_samplers[3].texture = slot.weather_mask_tex ? slot.weather_mask_tex :
-                               ( slot.light_tex ? slot.light_tex : slot.depth_tex );
-    post_samplers[3].sampler = g_ctx.sampler;
-    SDL_BindGPUFragmentSamplers( post_pass, 0, post_samplers, 4 );
-    SDL_PushGPUFragmentUniformData( cmd, 0, &weather_post_ub, sizeof( weather_post_ub ) );
+    SDL_BindGPUFragmentSamplers( post_pass, 0, post_samplers, 2 );
     SDL_DrawGPUPrimitives( post_pass, 3, 1, 0, 0 );
     SDL_EndGPURenderPass( post_pass );
 

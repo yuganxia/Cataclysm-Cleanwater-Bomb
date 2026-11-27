@@ -3,6 +3,9 @@
 // SDL GPU vertex uniform buffers live in set 1.
 
 #version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "water_waves3d.glsl"
 
 layout(location = 0) in vec3 a_pos;         // box: [0,1]^3 corner; xquad: [0,1]^2 diag x [0,1] up; billboard: x[-.5,.5], y[0,1]
 layout(location = 1) in vec3 a_aux;         // box: face normal; xquad/billboard: (u, v, unused)
@@ -21,6 +24,8 @@ layout(set = 1, binding = 0) uniform UBO {
     vec4 cam_up;     // xyz: world up (billboard facing)
     vec4 params;     // x = mode: 0 box, 1 static xquad, 2 yaw billboard, 3 cardinal-snapped billboard, 4 axis quad (fence), 5 flat horizontal quad
     vec4 sun_dir;    // xyz = direction toward the sun (world), w = 1 when the sun is up
+    vec4 water_vertex; // xy = map origin, z = seconds, w = wave height amplitude
+    vec4 water_flow;   // xy = world wind direction, z = normalized speed
 };
 
 layout(location = 0) out vec4 v_color;
@@ -143,6 +148,12 @@ void main()
         float diff = max( dot( n, light_dir ), 0.0 );
         shade = 0.55 + 0.45 * diff;
         sun_shade = sun_dir.w > 0.5 ? 0.45 * diff : 0.0;
+    }
+    int water_flags = int( a_inst_flags + 0.5 );
+    if( water_vertex.w > 0.0 && ( water_flags & 16384 ) != 0 &&
+        ( mode == 5 || ( mode == 0 && a_aux.z > 0.5 ) ) ) {
+        world.z += water_wave_height( world.xy + water_vertex.xy, water_flow.xy,
+                                      water_vertex.z, water_vertex.w, water_flow.z );
     }
     v_tile = a_inst_pos;
     v_sun = sun_shade;

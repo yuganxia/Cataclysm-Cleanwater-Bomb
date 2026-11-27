@@ -20,10 +20,12 @@ vec3 sky3d_radiance( vec3 ray, vec3 eye_position, vec3 sun_direction, float dayl
     sun_emission = vec3( 0.0 );
     if( sun_direction.z > -0.05 && daylight > 0.01 ) {
         float d = dot( ray, normalize( sun_direction ) );
-        float disc = smoothstep( 0.9994, 0.9998, d );
-        float halo = pow( max( d, 0.0 ), 64.0 ) * 0.25;
-        sun_emission = ( vec3( 4.0, 3.8, 3.2 ) * disc + vec3( 1.0, 0.9, 0.7 ) * halo ) * daylight;
-        col += sun_emission;
+        float disc = smoothstep( 0.99935, 0.99975, d );
+        float halo = pow( max( d, 0.0 ), 32.0 ) * 0.48;
+        float forward_scatter = pow( max( d, 0.0 ), 10.0 ) * 0.10;
+        sun_emission = ( vec3( 7.0, 5.7, 3.8 ) * disc +
+                         vec3( 1.35, 1.05, 0.72 ) * halo ) * daylight;
+        col += sun_emission + vec3( 0.20, 0.13, 0.065 ) * forward_scatter * daylight;
     }
 
     if( ray.z > 0.02 ) {
