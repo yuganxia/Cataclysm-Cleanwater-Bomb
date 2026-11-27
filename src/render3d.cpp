@@ -640,6 +640,8 @@ struct frame_slot {
     SDL_GPUTexture *hdr_tex = nullptr;
     SDL_GPUTexture *water_tex = nullptr;
     SDL_GPUTexture *emissive_tex = nullptr;
+    SDL_GPUTexture *bounce_raw_tex = nullptr;
+    std::array<SDL_GPUTexture *, 2> bounce_blur_tex{};
     std::array<std::array<SDL_GPUTexture *, 2>, BLOOM_LEVEL_COUNT> bloom_tex{};
     SDL_GPUTexture *depth_tex = nullptr;
     SDL_GPUTexture *ao_raw_tex = nullptr;
@@ -679,6 +681,9 @@ struct context {
     SDL_GPUGraphicsPipeline *post_bloom_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *bloom_extract_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *bloom_blur_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline *bounce_extract_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline *bounce_blur_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline *bounce_apply_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *water_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *precipitation_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *prepass_pipeline = nullptr;
@@ -1063,6 +1068,16 @@ void context::teardown()
                 SDL_ReleaseGPUTexture( device, slot.emissive_tex );
                 slot.emissive_tex = nullptr;
             }
+            if( slot.bounce_raw_tex ) {
+                SDL_ReleaseGPUTexture( device, slot.bounce_raw_tex );
+                slot.bounce_raw_tex = nullptr;
+            }
+            for( SDL_GPUTexture *&bounce : slot.bounce_blur_tex ) {
+                if( bounce ) {
+                    SDL_ReleaseGPUTexture( device, bounce );
+                    bounce = nullptr;
+                }
+            }
             for( auto &level : slot.bloom_tex ) {
                 for( SDL_GPUTexture *&bloom : level ) {
                     if( bloom ) {
@@ -1192,6 +1207,18 @@ void context::teardown()
             SDL_ReleaseGPUGraphicsPipeline( device, bloom_blur_pipeline );
             bloom_blur_pipeline = nullptr;
         }
+        if( bounce_extract_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, bounce_extract_pipeline );
+            bounce_extract_pipeline = nullptr;
+        }
+        if( bounce_blur_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, bounce_blur_pipeline );
+            bounce_blur_pipeline = nullptr;
+        }
+        if( bounce_apply_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, bounce_apply_pipeline );
+            bounce_apply_pipeline = nullptr;
+        }
         if( water_pipeline ) {
             SDL_ReleaseGPUGraphicsPipeline( device, water_pipeline );
             water_pipeline = nullptr;
@@ -1263,6 +1290,16 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
         if( slot.emissive_tex ) {
             SDL_ReleaseGPUTexture( g_ctx.device, slot.emissive_tex );
             slot.emissive_tex = nullptr;
+        }
+        if( slot.bounce_raw_tex ) {
+            SDL_ReleaseGPUTexture( g_ctx.device, slot.bounce_raw_tex );
+            slot.bounce_raw_tex = nullptr;
+        }
+        for( SDL_GPUTexture *&bounce : slot.bounce_blur_tex ) {
+            if( bounce ) {
+                SDL_ReleaseGPUTexture( g_ctx.device, bounce );
+                bounce = nullptr;
+            }
         }
         for( auto &level : slot.bloom_tex ) {
             for( SDL_GPUTexture *&bloom : level ) {
@@ -1398,6 +1435,15 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
             write_status( "GTAO textures unavailable; ambient occlusion disabled" );
         }
         ci.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+        slot.bounce_raw_tex = SDL_CreateGPUTexture( g_ctx.device, &ci );
+        bool bounce_targets_ok = slot.bounce_raw_tex != nullptr;
+        for( SDL_GPUTexture *&bounce : slot.bounce_blur_tex ) {
+            bounce = SDL_CreateGPUTexture( g_ctx.device, &ci );
+            bounce_targets_ok = bounce_targets_ok && bounce;
+        }
+        if( !bounce_targets_ok ) {
+            write_status( "sun-bounce textures unavailable; indoor light diffusion disabled" );
+        }
         bool bloom_ok = true;
         for( int level = 0; level < BLOOM_LEVEL_COUNT; ++level ) {
             const int divisor = 1 << ( level + 1 );
@@ -1705,7 +1751,7 @@ bool probe( SDL_Renderer *renderer )
     g_ctx.device = device;
 
     SDL_GPUShader *vs = load_shader( device, "terrain3d.vert", SDL_GPU_SHADERSTAGE_VERTEX, 1 );
-    SDL_GPUShader *fs = load_shader( device, "terrain3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 4 );
+    SDL_GPUShader *fs = load_shader( device, "terrain3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 5 );
     if( !vs || !fs ) {
         if( vs ) {
             SDL_ReleaseGPUShader( device, vs );
@@ -1911,9 +1957,15 @@ bool probe( SDL_Renderer *renderer )
     SDL_GPUShader *ao_blur_fs = load_shader( device, "gtao3d_blur.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 0,
                                  1 );
     SDL_GPUShader *bloom_extract_fs = load_shader( device, "bloom3d_extract.frag",
-                                      SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 2 );
+                                      SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 3 );
     SDL_GPUShader *bloom_blur_fs = load_shader( device, "bloom3d_blur.frag",
                                     SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
+    SDL_GPUShader *bounce_extract_fs = load_shader( device, "bounce3d_extract.frag",
+                                       SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 4 );
+    SDL_GPUShader *bounce_blur_fs = load_shader( device, "bounce3d_blur.frag",
+                                    SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
+    SDL_GPUShader *bounce_apply_fs = load_shader( device, "bounce3d_apply.frag",
+                                    SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 4 );
     SDL_GPUShader *post_bloom_fs = load_shader( device, "tonemap3d_bloom.frag",
                                    SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 6 );
     SDL_GPUShader *water_fs = load_shader( device, "water3d.frag",
@@ -1954,6 +2006,31 @@ bool probe( SDL_Renderer *renderer )
         ppi.fragment_shader = bloom_blur_fs;
         pcolor_desc.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
         g_ctx.bloom_blur_pipeline = SDL_CreateGPUGraphicsPipeline( device, &ppi );
+    }
+    if( post_vs && bounce_extract_fs ) {
+        ppi.fragment_shader = bounce_extract_fs;
+        pcolor_desc.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+        g_ctx.bounce_extract_pipeline = SDL_CreateGPUGraphicsPipeline( device, &ppi );
+    }
+    if( post_vs && bounce_blur_fs ) {
+        ppi.fragment_shader = bounce_blur_fs;
+        pcolor_desc.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+        g_ctx.bounce_blur_pipeline = SDL_CreateGPUGraphicsPipeline( device, &ppi );
+    }
+    if( post_vs && bounce_apply_fs ) {
+        SDL_GPUGraphicsPipelineCreateInfo apply_pi = ppi;
+        apply_pi.fragment_shader = bounce_apply_fs;
+        SDL_GPUColorTargetDescription apply_color = pcolor_desc;
+        apply_color.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+        apply_color.blend_state.enable_blend = true;
+        apply_color.blend_state.src_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+        apply_color.blend_state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+        apply_color.blend_state.color_blend_op = SDL_GPU_BLENDOP_ADD;
+        apply_color.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ZERO;
+        apply_color.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+        apply_color.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+        apply_pi.target_info.color_target_descriptions = &apply_color;
+        g_ctx.bounce_apply_pipeline = SDL_CreateGPUGraphicsPipeline( device, &apply_pi );
     }
     if( post_vs && post_bloom_fs ) {
         ppi.fragment_shader = post_bloom_fs;
@@ -2011,6 +2088,15 @@ bool probe( SDL_Renderer *renderer )
     if( bloom_blur_fs ) {
         SDL_ReleaseGPUShader( device, bloom_blur_fs );
     }
+    if( bounce_extract_fs ) {
+        SDL_ReleaseGPUShader( device, bounce_extract_fs );
+    }
+    if( bounce_blur_fs ) {
+        SDL_ReleaseGPUShader( device, bounce_blur_fs );
+    }
+    if( bounce_apply_fs ) {
+        SDL_ReleaseGPUShader( device, bounce_apply_fs );
+    }
     if( post_bloom_fs ) {
         SDL_ReleaseGPUShader( device, post_bloom_fs );
     }
@@ -2034,6 +2120,10 @@ bool probe( SDL_Renderer *renderer )
     if( !g_ctx.bloom_extract_pipeline || !g_ctx.bloom_blur_pipeline ||
         !g_ctx.post_bloom_pipeline ) {
         write_status( "Bloom post pipeline unavailable; Bloom disabled" );
+    }
+    if( !g_ctx.bounce_extract_pipeline || !g_ctx.bounce_blur_pipeline ||
+        !g_ctx.bounce_apply_pipeline ) {
+        write_status( "sun-bounce pipeline unavailable; indoor light diffusion disabled" );
     }
     if( !g_ctx.water_pipeline ) {
         write_status( "water pipeline unavailable; water reflections disabled" );
@@ -2399,6 +2489,20 @@ bool empty_frame_terrain( const ter_t &t )
 {
     return t.movecost > 0 && t.open.is_null() && t.close.is_null() &&
            ( t.has_flag( ter_furn_flag::TFLAG_WINDOW ) || wall_opening( t ) );
+}
+
+// Transparent structural faces transmit the game's direct light as well as its
+// map light. Damaged doors and fences stay on the alpha-cutout caster path so
+// their surviving boards and rails do not lose their shadows with the opening.
+bool sun_transparent_structure( const ter_t &t, const bool is_panel, const bool is_wall )
+{
+    if( !t.transparent ) {
+        return false;
+    }
+    return is_wall || ( is_panel &&
+                        ( t.has_flag( ter_furn_flag::TFLAG_WINDOW ) ||
+                          t.has_flag( ter_furn_flag::TFLAG_DOOR ) ||
+                          t.has_flag( ter_furn_flag::TFLAG_TRANSLUCENT ) || wall_opening( t ) ) );
 }
 
 // a solid wall whose sprite can clamp a door/window panel (sill + lintel) or
@@ -2793,6 +2897,8 @@ constexpr int CREATURE_NEUTRAL_FLAG = 1 << 12;
 constexpr int CREATURE_FRIENDLY_FLAG = 1 << 13;
 constexpr int WATER_FLAG = 1 << 14;
 constexpr int SHADOW_ONLY_FLAG = 1 << 15;
+constexpr int SUN_TRANSPARENT_FLAG = 1 << 16;
+constexpr int SUN_PORTAL_FLAG = 1 << 17;
 
 std::array<float, 4> emission_from_light( const float emitted,
         const light_color_rgb &light_color = {} )
@@ -2852,6 +2958,8 @@ void push_instance( instance_sink out, const float dx, const float dy,
     // bit11-13: hostile / neutral / friendly creature outline for the composite
     // bit14: water top surface, exported through the emissive target's alpha
     // bit15: shadow-only geometry, hidden from color and camera-depth passes
+    // bit16: light-transmitting structure, visible everywhere except shadow depth
+    // bit17: light-transmitting door/window opening, used as a sun-portal source
     // pad: side-strip v, or the run direction for MODE_LINEQUAD (0 = E-W)
     out.data[14] = ( spr.atlas ? 1.0f : 0.0f ) + ( no_discard ? 2.0f : 0.0f ) +
                    static_cast<float>( ( rota4 & 3 ) << 2 ) + ( side_strip ? 16.0f : 0.0f ) +
@@ -2876,6 +2984,19 @@ void mark_same_level_wall( std::vector<float> &out, const bool current_level )
     // Keep full-height geometry. The fragment shader fades the wall assembly
     // from a solid lower third to a fully transparent upper half.
     out[out.size() - stride + 14] += 1024.0f;
+}
+
+void mark_sun_transparent( std::vector<float> &out, const bool transmits_sun,
+                           const bool sun_portal = false )
+{
+    constexpr size_t stride = INSTANCE_STRIDE / sizeof( float );
+    if( !transmits_sun || out.size() < stride ) {
+        return;
+    }
+    out[out.size() - stride + 14] += static_cast<float>( SUN_TRANSPARENT_FLAG );
+    if( sun_portal ) {
+        out[out.size() - stride + 14] += static_cast<float>( SUN_PORTAL_FLAG );
+    }
 }
 
 void push_lod_instance( instance_sink out, const float dx, const float dy,
@@ -3464,6 +3585,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
         bool is_tree = false;
         bool is_shrub = false;
         bool is_wall = false;
+        bool sun_transparent = false;
+        bool sun_portal = false;
     };
     std::vector<std::optional<structure_traits>> structure_traits_cache;
     const auto structure_traits_for = [&]( const ter_t & t,
@@ -3489,6 +3612,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
         const bool is_upright = upright_equipment_terrain( t );
         traits.is_wall = !traits.is_tree && !traits.is_shrub && !is_panel && !is_fence &&
         !is_upright && t.movecost == 0;
+        traits.sun_transparent = sun_transparent_structure( t, is_panel, traits.is_wall );
+        traits.sun_portal = traits.sun_transparent && is_panel;
         const int subtile = traits.is_wall ? SUBTILE_EDGE : -1;
         const int rota = traits.is_wall ? 1 : 0;
         sprite_lookup_3d layers;
@@ -3550,6 +3675,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
             push_lod_instance( v, static_cast<float>( d.x ), static_cast<float>( d.y ), wz,
                                1.0f, 1.0f, WALL_HEIGHT, traits.object_sprite,
                                color[0], color[1], color[2], true );
+            mark_sun_transparent( v, traits.sun_transparent, traits.sun_portal );
             mark_same_level_wall( v, wz == 0.0f );
             ++count;
             drew = true;
@@ -3809,6 +3935,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
         const bool is_upright_equipment = upright_equipment_terrain( t );
         const bool is_wall = !is_tree && !is_shrub && !is_panel && !is_fence &&
                              !is_upright_equipment && t.movecost == 0;
+        const bool sun_transparent = sun_transparent_structure( t, is_panel, is_wall );
         const bool plain_floor = !is_tree && !is_shrub && !is_panel && !is_fence &&
                                  !is_wall && !is_upright_equipment;
         // an edge segment's stored rotation is 0 for a N-S wall line and 1 for
@@ -3999,6 +4126,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                 if( !is_empty_frame ) {
                     push_instance( v, px, py, wz + SILL_H, psx, psy, SILL_H, facespr,
                                    pr, pg, pb, false, 0, false, -1.0f, false, 1.0f, true );
+                    mark_sun_transparent( v, sun_transparent, is_panel );
                     mark_same_level_wall( v, wz == 0.0f );
                     ++count;
                 }
@@ -4041,6 +4169,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                 if( !is_empty_frame ) {
                     push_instance( v, px, py, wz, psx, psy, PANEL_HEIGHT, facespr,
                                    pr, pg, pb, false, 0, false, -1.0f, false, 1.0f, true );
+                    mark_sun_transparent( v, sun_transparent, is_panel );
                     mark_same_level_wall( v, wz == 0.0f );
                     ++count;
                 }
@@ -4142,6 +4271,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
             push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ), wz,
                            1.0f, 1.0f, WALL_HEIGHT, fspr, or_, og, ob,
                            false, 0, false, -1.0f, false, 1.0f, true );
+            mark_sun_transparent( v, sun_transparent, is_panel );
             mark_same_level_wall( v, wz == 0.0f );
             ++count;
         }
@@ -4343,6 +4473,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                 const bool is_upright_equipment = upright_equipment_terrain( *t );
                 const bool is_wall = !is_tree && !is_shrub && !is_panel && !is_fence &&
                                      !is_upright_equipment && t->movecost == 0;
+                const bool sun_transparent = sun_transparent_structure( *t, is_panel, is_wall );
                 // wall-line connections orient door/window panels and fence slabs
                 // (bit order S=1, E=2, W=4, N=8)
                 const uint8_t wall_conn = ( is_panel || ( is_fence && !is_flat_utility ) )
@@ -4633,6 +4764,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                             push_instance( v, px, py, wz + SILL_H, psx, psy, SILL_H, facespr,
                                            pr, pg, pb, false, 0, false, -1.0f, ghost, tone.sat,
                                            false, false, false, 0, terrain_emission );
+                            mark_sun_transparent( v, sun_transparent, is_panel );
                             mark_same_level_wall( v, dz == 0 );
                             ++count;
                         }
@@ -4676,6 +4808,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                             push_instance( v, px, py, wz, psx, psy, PANEL_HEIGHT, facespr,
                                            pr, pg, pb, false, 0, false, -1.0f, ghost, tone.sat,
                                            false, false, false, 0, terrain_emission );
+                            mark_sun_transparent( v, sun_transparent, is_panel );
                             mark_same_level_wall( v, dz == 0 );
                             ++count;
                         }
@@ -4787,6 +4920,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                    1.0f, 1.0f, WALL_HEIGHT, fspr, or_, og, ob,
                                    false, 0, false, -1.0f, ghost, tone.sat,
                                    false, false, false, 0, terrain_emission );
+                    mark_sun_transparent( v, sun_transparent, is_panel );
                     mark_same_level_wall( v, dz == 0 );
                     ++count;
                 }
@@ -7240,8 +7374,10 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> ambient_color;
         std::array<float, 4> ground_color;
         std::array<float, 4> lighting_params;
+        std::array<float, 4> mask_mapping;
+        std::array<float, 4> bounce_params;
     };
-    static_assert( sizeof( frag_uniforms ) == 28 * 16, "terrain3d fragment UBO must match std140" );
+    static_assert( sizeof( frag_uniforms ) == 30 * 16, "terrain3d fragment UBO must match std140" );
     frag_uniforms frag_ub{};
     const tripoint_bub_ms upos = get_avatar().pos_bub();
     const float player_gz = ( upos.z() - center.z() ) * LEVEL_HEIGHT;
@@ -7315,6 +7451,10 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
                            ? std::array<float, 4> { 0.28f, 0.24f, 0.18f, 0.0f }
                            : std::array<float, 4> { 0.065f, 0.075f, 0.12f, 0.0f };
     frag_ub.lighting_params = { night_amount, 0.85f, 45.0f, 95.0f };
+    frag_ub.mask_mapping = { static_cast<float>( center.x() ), static_cast<float>( center.y() ),
+                             LEVEL_HEIGHT, static_cast<float>( WEATHER_MASK_LAYERS )
+                           };
+    frag_ub.bounce_params = { 0.0f, 2.75f, 2.2f, 0.0f };
     water_ub.sunlight_color = frag_ub.sunlight_color;
 
     struct post_uniforms {
@@ -7348,6 +7488,50 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     gtao_ub.proj_params = { std::tan( g_fov_y * 0.5f ), g_aspect, camera_near, camera_far };
     gtao_ub.screen_params = { static_cast<float>( w ), static_cast<float>( h ), 0.0f, 0.0f };
     gtao_ub.ao_params = { 1.65f, 2.5f, 1.12f, 0.0f };
+
+    struct bounce_extract_uniforms {
+        std::array<float, 4> eye_pos;
+        std::array<float, 4> cam_right;
+        std::array<float, 4> cam_up;
+        std::array<float, 4> cam_forward;
+        mat4 light_vp;
+        std::array<float, 4> ray_params;
+        std::array<float, 4> sun_dir;
+        std::array<float, 4> shadow_params;
+        std::array<float, 4> bounce_params;
+    };
+    static_assert( sizeof( bounce_extract_uniforms ) == 12 * 16,
+                   "sun-bounce extract UBO must match std140" );
+    bounce_extract_uniforms bounce_extract_ub{};
+    bounce_extract_ub.eye_pos = sky_ub.eye_pos;
+    bounce_extract_ub.cam_right = sky_ub.cam_right;
+    bounce_extract_ub.cam_up = sky_ub.cam_up;
+    bounce_extract_ub.cam_forward = sky_ub.cam_forward;
+    bounce_extract_ub.light_vp = light_vp;
+    bounce_extract_ub.ray_params = water_ub.ray_params;
+    bounce_extract_ub.sun_dir = sky_ub.sun_dir;
+    bounce_extract_ub.shadow_params = frag_ub.shadow_params;
+    bounce_extract_ub.bounce_params = { 0.0f, 45.0f, 95.0f, 0.0f };
+
+    struct bounce_apply_uniforms {
+        std::array<float, 4> eye_pos;
+        std::array<float, 4> cam_right;
+        std::array<float, 4> cam_up;
+        std::array<float, 4> cam_forward;
+        std::array<float, 4> ray_params;
+        std::array<float, 4> mask_mapping;
+        std::array<float, 4> bounce_params;
+    };
+    static_assert( sizeof( bounce_apply_uniforms ) == 7 * 16,
+                   "sun-bounce apply UBO must match std140" );
+    bounce_apply_uniforms bounce_apply_ub{};
+    bounce_apply_ub.eye_pos = sky_ub.eye_pos;
+    bounce_apply_ub.cam_right = sky_ub.cam_right;
+    bounce_apply_ub.cam_up = sky_ub.cam_up;
+    bounce_apply_ub.cam_forward = sky_ub.cam_forward;
+    bounce_apply_ub.ray_params = water_ub.ray_params;
+    bounce_apply_ub.mask_mapping = frag_ub.mask_mapping;
+    bounce_apply_ub.bounce_params = { 0.55f, 45.0f, 95.0f, 0.0f };
 
     struct precipitation_uniforms {
         mat4 view_proj;
@@ -7412,9 +7596,6 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     const bool precipitation_requested = !nv_tint && center.z() >= 0 &&
                                          precipitation_strength > 0.001f &&
                                          slot.depth_tex && g_ctx.precipitation_pipeline;
-    const bool weather_mask_ready = precipitation_requested &&
-                                    upload_weather_mask( cmd, slot, here, center.z(), now_ticks );
-    const bool precipitation_ready = precipitation_requested && weather_mask_ready;
     const bool shadows_ready = caster_frustum && slot.shadow_tex && g_ctx.shadow_pipeline &&
                                g_ctx.shadow_sampler;
     frag_ub.shadow_params[0] = shadows_ready ? 1.0f : 0.0f;
@@ -7425,6 +7606,17 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     const bool mrt_ready = slot.emissive_tex && g_ctx.pipeline_mrt &&
                            g_ctx.pipeline_decal_mrt &&
                            ( !g_ctx.sky_pipeline || g_ctx.sky_mrt_pipeline );
+    const bool bounce_resources_ready = day_key && !nv_tint && mrt_ready && shadows_ready &&
+                                        slot.depth_tex && slot.bounce_raw_tex && slot.bounce_blur_tex[0] &&
+                                        slot.bounce_blur_tex[1] && g_ctx.bounce_extract_pipeline &&
+                                        g_ctx.bounce_blur_pipeline && g_ctx.bounce_apply_pipeline &&
+                                        g_ctx.linear_sampler;
+    const bool weather_mask_requested = precipitation_requested || bounce_resources_ready;
+    const bool weather_mask_ready = weather_mask_requested &&
+                                    upload_weather_mask( cmd, slot, here, center.z(), now_ticks );
+    const bool precipitation_ready = precipitation_requested && weather_mask_ready;
+    const bool bounce_ready = bounce_resources_ready && weather_mask_ready;
+    frag_ub.bounce_params[0] = bounce_ready ? 1.0f : 0.0f;
     bool bloom_targets_ready = true;
     for( const auto &level : slot.bloom_tex ) {
         bloom_targets_ready = bloom_targets_ready && level[0] && level[1];
@@ -7435,7 +7627,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     const bool water_ready = !nv_tint_active() && mrt_ready && slot.water_tex &&
                              slot.depth_tex && g_ctx.water_pipeline &&
                              g_ctx.sampler && g_ctx.linear_sampler;
-    const bool mrt_active = bloom_ready || water_ready;
+    const bool mrt_active = bloom_ready || water_ready || bounce_ready;
     uniforms.water_vertex[3] = water_ready
                                ? std::clamp( 0.035f + weather.windspeed * 0.0015f, 0.035f, 0.065f )
                                : 0.0f;
@@ -7607,7 +7799,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
             const SDL_GPUBufferBinding vbs[2] = { geom_bind, inst_bind };
             SDL_BindGPUVertexBuffers( prepass, 0, vbs, 2 );
             SDL_GPUTexture *atlas_gpu = seg.atlas ? gpu_texture_of( seg.atlas ) : g_ctx.fallback_tex;
-            SDL_GPUTextureSamplerBinding sampler_binds[4]{};
+            std::array<SDL_GPUTextureSamplerBinding, 5> sampler_binds{};
             sampler_binds[0].texture = atlas_gpu ? atlas_gpu : g_ctx.fallback_tex;
             sampler_binds[0].sampler = g_ctx.sampler;
             sampler_binds[1].texture = shadows_ready ? slot.shadow_tex : g_ctx.fallback_tex;
@@ -7616,7 +7808,9 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
             sampler_binds[2].sampler = g_ctx.sampler;
             sampler_binds[3].texture = g_ctx.fallback_tex;
             sampler_binds[3].sampler = g_ctx.linear_sampler;
-            SDL_BindGPUFragmentSamplers( prepass, 0, sampler_binds, 4 );
+            sampler_binds[4].texture = weather_mask_ready ? slot.weather_mask_tex : g_ctx.fallback_tex;
+            sampler_binds[4].sampler = g_ctx.sampler;
+            SDL_BindGPUFragmentSamplers( prepass, 0, sampler_binds.data(), sampler_binds.size() );
             uniforms.params = { static_cast<float>( seg.mode ), 0.0f, 0.0f, 0.0f };
             SDL_PushGPUVertexUniformData( cmd, 0, &uniforms, sizeof( uniforms ) );
             frag_ub.mask_params[3] = ( seg.mode == MODE_BOX || seg.mode == MODE_LINEQUAD ||
@@ -7673,7 +7867,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     SDL_GPUDepthStencilTargetInfo depth_target{};
     depth_target.texture = slot.depth_tex;
     depth_target.load_op = ao_ready ? SDL_GPU_LOADOP_LOAD : SDL_GPU_LOADOP_CLEAR;
-    depth_target.store_op = g_ctx.sky_pipeline || water_ready || precipitation_ready ?
+    depth_target.store_op = g_ctx.sky_pipeline || water_ready || precipitation_ready || bounce_ready ?
                             SDL_GPU_STOREOP_STORE : SDL_GPU_STOREOP_DONT_CARE;
     depth_target.clear_depth = 1.0f;
 
@@ -7715,7 +7909,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         const SDL_GPUBufferBinding vbs[2] = { geom_bind, inst_bind };
         SDL_BindGPUVertexBuffers( pass, 0, vbs, 2 );
         SDL_GPUTexture *atlas_gpu = seg.atlas ? gpu_texture_of( seg.atlas ) : g_ctx.fallback_tex;
-        SDL_GPUTextureSamplerBinding sampler_binds[4]{};
+        std::array<SDL_GPUTextureSamplerBinding, 5> sampler_binds{};
         sampler_binds[0].texture = atlas_gpu ? atlas_gpu : g_ctx.fallback_tex;
         sampler_binds[0].sampler = g_ctx.sampler;
         sampler_binds[1].texture = shadows_ready ? slot.shadow_tex : g_ctx.fallback_tex;
@@ -7724,7 +7918,9 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         sampler_binds[2].sampler = g_ctx.sampler;
         sampler_binds[3].texture = ao_ready ? slot.ao_tex : g_ctx.fallback_tex;
         sampler_binds[3].sampler = ao_ready ? g_ctx.linear_sampler : g_ctx.sampler;
-        SDL_BindGPUFragmentSamplers( pass, 0, sampler_binds, 4 );
+        sampler_binds[4].texture = weather_mask_ready ? slot.weather_mask_tex : g_ctx.fallback_tex;
+        sampler_binds[4].sampler = g_ctx.sampler;
+        SDL_BindGPUFragmentSamplers( pass, 0, sampler_binds.data(), sampler_binds.size() );
         // decal modes share their geometry path with the plain modes
         // (6 -> flatquad 5, 7 -> fence linequad 4); the shader never sees them
         const int shader_mode = seg.mode == MODE_FLATQUAD_DECAL ? MODE_FLATQUAD :
@@ -7759,8 +7955,8 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         SDL_GPUDepthStencilTargetInfo sky_depth{};
         sky_depth.texture = slot.depth_tex;
         sky_depth.load_op = SDL_GPU_LOADOP_LOAD;
-        sky_depth.store_op = water_ready || precipitation_ready ? SDL_GPU_STOREOP_STORE :
-                             SDL_GPU_STOREOP_DONT_CARE;
+        sky_depth.store_op = water_ready || precipitation_ready || bounce_ready ?
+                             SDL_GPU_STOREOP_STORE : SDL_GPU_STOREOP_DONT_CARE;
         SDL_GPURenderPass *sky_pass = SDL_BeginGPURenderPass( cmd, sky_targets,
                                       mrt_active ? 2 : 1, &sky_depth );
         SDL_BindGPUGraphicsPipeline( sky_pass,
@@ -7768,6 +7964,79 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         SDL_PushGPUFragmentUniformData( cmd, 0, &sky_ub, sizeof( sky_ub ) );
         SDL_DrawGPUPrimitives( sky_pass, 3, 1, 0, 0 );
         SDL_EndGPURenderPass( sky_pass );
+    }
+
+    if( bounce_ready ) {
+        SDL_GPUColorTargetInfo extract_target{};
+        extract_target.texture = slot.bounce_raw_tex;
+        extract_target.load_op = SDL_GPU_LOADOP_CLEAR;
+        extract_target.store_op = SDL_GPU_STOREOP_STORE;
+        extract_target.clear_color = { 0.0f, 0.0f, 0.0f, camera_far };
+        SDL_GPURenderPass *extract_pass = SDL_BeginGPURenderPass( cmd, &extract_target, 1, nullptr );
+        SDL_BindGPUGraphicsPipeline( extract_pass, g_ctx.bounce_extract_pipeline );
+        SDL_GPUTextureSamplerBinding extract_samplers[4]{};
+        extract_samplers[0].texture = slot.hdr_tex;
+        extract_samplers[0].sampler = g_ctx.linear_sampler;
+        extract_samplers[1].texture = slot.depth_tex;
+        extract_samplers[1].sampler = g_ctx.sampler;
+        extract_samplers[2].texture = slot.shadow_tex;
+        extract_samplers[2].sampler = g_ctx.shadow_sampler;
+        extract_samplers[3].texture = slot.emissive_tex;
+        extract_samplers[3].sampler = g_ctx.sampler;
+        SDL_BindGPUFragmentSamplers( extract_pass, 0, extract_samplers, 4 );
+        SDL_PushGPUFragmentUniformData( cmd, 0, &bounce_extract_ub, sizeof( bounce_extract_ub ) );
+        SDL_DrawGPUPrimitives( extract_pass, 3, 1, 0, 0 );
+        SDL_EndGPURenderPass( extract_pass );
+
+        const float source_w = static_cast<float>( ( w + 1 ) / 2 );
+        const float source_h = static_cast<float>( ( h + 1 ) / 2 );
+        for( int axis = 0; axis < 2; ++axis ) {
+            SDL_GPUColorTargetInfo blur_target{};
+            blur_target.texture = axis == 0 ? slot.bounce_blur_tex[1] : slot.bounce_blur_tex[0];
+            blur_target.load_op = SDL_GPU_LOADOP_CLEAR;
+            blur_target.store_op = SDL_GPU_STOREOP_STORE;
+            blur_target.clear_color = { 0.0f, 0.0f, 0.0f, camera_far };
+            SDL_GPURenderPass *blur_pass = SDL_BeginGPURenderPass( cmd, &blur_target, 1, nullptr );
+            SDL_BindGPUGraphicsPipeline( blur_pass, g_ctx.bounce_blur_pipeline );
+            SDL_GPUTextureSamplerBinding blur_sampler{};
+            blur_sampler.texture = axis == 0 ? slot.bounce_raw_tex : slot.bounce_blur_tex[1];
+            blur_sampler.sampler = g_ctx.linear_sampler;
+            SDL_BindGPUFragmentSamplers( blur_pass, 0, &blur_sampler, 1 );
+            const std::array<float, 4> direction = {
+                axis == 0 ? 1.0f / source_w : 0.0f,
+                axis == 1 ? 1.0f / source_h : 0.0f, 0.025f, 3.2f
+            };
+            const std::array<float, 4> projection = {
+                static_cast<float>( h ), std::tan( g_fov_y * 0.5f ), 96.0f, 0.0f
+            };
+            // Two consecutive vec4 values form the std140 blur UBO.
+            std::array<float, 8> blur_ub{};
+            std::copy( direction.begin(), direction.end(), blur_ub.begin() );
+            std::copy( projection.begin(), projection.end(), blur_ub.begin() + 4 );
+            SDL_PushGPUFragmentUniformData( cmd, 0, blur_ub.data(), sizeof( blur_ub ) );
+            SDL_DrawGPUPrimitives( blur_pass, 3, 1, 0, 0 );
+            SDL_EndGPURenderPass( blur_pass );
+        }
+
+        SDL_GPUColorTargetInfo apply_target{};
+        apply_target.texture = slot.hdr_tex;
+        apply_target.load_op = SDL_GPU_LOADOP_LOAD;
+        apply_target.store_op = SDL_GPU_STOREOP_STORE;
+        SDL_GPURenderPass *apply_pass = SDL_BeginGPURenderPass( cmd, &apply_target, 1, nullptr );
+        SDL_BindGPUGraphicsPipeline( apply_pass, g_ctx.bounce_apply_pipeline );
+        SDL_GPUTextureSamplerBinding apply_samplers[4]{};
+        apply_samplers[0].texture = slot.bounce_raw_tex;
+        apply_samplers[0].sampler = g_ctx.linear_sampler;
+        apply_samplers[1].texture = slot.bounce_blur_tex[0];
+        apply_samplers[1].sampler = g_ctx.linear_sampler;
+        apply_samplers[2].texture = slot.depth_tex;
+        apply_samplers[2].sampler = g_ctx.sampler;
+        apply_samplers[3].texture = slot.weather_mask_tex;
+        apply_samplers[3].sampler = g_ctx.sampler;
+        SDL_BindGPUFragmentSamplers( apply_pass, 0, apply_samplers, 4 );
+        SDL_PushGPUFragmentUniformData( cmd, 0, &bounce_apply_ub, sizeof( bounce_apply_ub ) );
+        SDL_DrawGPUPrimitives( apply_pass, 3, 1, 0, 0 );
+        SDL_EndGPURenderPass( apply_pass );
     }
 
     if( precipitation_ready ) {
@@ -7831,12 +8100,20 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         extract_target.clear_color = { 0.0f, 0.0f, 0.0f, 1.0f };
         SDL_GPURenderPass *extract_pass = SDL_BeginGPURenderPass( cmd, &extract_target, 1, nullptr );
         SDL_BindGPUGraphicsPipeline( extract_pass, g_ctx.bloom_extract_pipeline );
-        SDL_GPUTextureSamplerBinding extract_samplers[2]{};
+        std::array<SDL_GPUTextureSamplerBinding, 3> extract_samplers{};
         extract_samplers[0].texture = water_ready ? slot.water_tex : slot.hdr_tex;
         extract_samplers[0].sampler = g_ctx.linear_sampler;
         extract_samplers[1].texture = slot.emissive_tex;
         extract_samplers[1].sampler = g_ctx.linear_sampler;
-        SDL_BindGPUFragmentSamplers( extract_pass, 0, extract_samplers, 2 );
+        extract_samplers[2].texture = bounce_ready ? slot.bounce_blur_tex[0] : g_ctx.fallback_tex;
+        extract_samplers[2].sampler = g_ctx.linear_sampler;
+        SDL_BindGPUFragmentSamplers( extract_pass, 0, extract_samplers.data(),
+                                     extract_samplers.size() );
+        const std::array<float, 4> sun_spill_params = {
+            bounce_ready ? 1.0f : 0.0f, 1.0f, 0.0f, 0.0f
+        };
+        SDL_PushGPUFragmentUniformData( cmd, 0, sun_spill_params.data(),
+                                        sizeof( sun_spill_params ) );
         SDL_DrawGPUPrimitives( extract_pass, 3, 1, 0, 0 );
         SDL_EndGPURenderPass( extract_pass );
 

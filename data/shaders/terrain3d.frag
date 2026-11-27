@@ -14,6 +14,7 @@ layout(set = 2, binding = 0) uniform sampler2D atlas_tex;
 layout(set = 2, binding = 1) uniform sampler2D shadow_tex;
 layout(set = 2, binding = 2) uniform sampler2D light_tex;
 layout(set = 2, binding = 3) uniform sampler2D ao_tex;
+layout(set = 2, binding = 4) uniform sampler2D weather_mask_tex;
 
 layout(set = 3, binding = 0) uniform FragUBO {
     vec4 eye_pos;      // xyz = camera position (scene coords)
@@ -44,7 +45,11 @@ layout(set = 3, binding = 0) uniform FragUBO {
     vec4 ground_color;   // rgb = ground hemisphere tint
     vec4 lighting_params; // x = night amount, y = local-light response,
                           // z/w = shadow fade start/end in world units
+    vec4 mask_mapping; // xy = map origin, z = level height, w = roof-mask layers
+    vec4 bounce_params; // x = enabled, y = indoor penumbra multiplier, z = portal gain
 };
+
+#include "weather3d.glsl"
 
 layout(location = 0) in vec4 v_color;
 layout(location = 1) in vec2 v_uv;
@@ -113,7 +118,12 @@ float sun_visibility( vec3 normal, vec3 light_dir )
 
     float blocker_depth = blocker_depth_sum / float( blocker_count );
     float world_gap = max( ( ndc.z - blocker_depth ) * shadow_pcss.y, 0.0 );
-    float penumbra_world = world_gap * shadow_pcss.z;
+    float penumbra_scale = 1.0;
+    if( bounce_params.x > 0.5 ) {
+        float indoor = 1.0 - weather_roof_exposure( v_world );
+        penumbra_scale = mix( 1.0, bounce_params.y, indoor );
+    }
+    float penumbra_world = world_gap * shadow_pcss.z * penumbra_scale;
     float radius = clamp( penumbra_world / shadow_pcss.x,
                           shadow_params.y, search_radius );
     float filter_bias = bias * ( 1.0 + 0.25 * radius / shadow_params.y );
@@ -361,6 +371,9 @@ void main()
         vec3 mem = memory_params.y > 0.5
                    ? memory_mixer( display_rgb, memory_dark.rgb, memory_light.rgb, memory_dark.w )
                    : memory_preset( int( memory_params.x + 0.5 ), display_rgb );
+        // Negative material alpha marks remembered scenery for the sun-bounce
+        // extraction pass. Water tests alpha < 0.5, so its behavior is unchanged.
+        out_emissive = vec4( 0.0, 0.0, 0.0, -1.0 );
         out_color = vec4( color3d_srgb_to_linear( mem ), composite_alpha );
         return;
     }
@@ -406,7 +419,20 @@ void main()
                    ( ambient_occlusion() * light_fill ) * local_tint;
     vec3 emission = v_emission.rgb *
                     ( textured ? color3d_srgb_to_linear( sampled.rgb ) : vec3( 1.0 ) );
+    // A transmitting opening is a source of visible sun spill, not merely a
+    // surface that happens to face the sun. Keep some albedo in the portal core
+    // so different glass and door sprites retain their own color and detail.
+    bool sun_portal = ( flags & 131072 ) != 0 && bounce_params.x > 0.5;
+    float portal_fade = 1.0 - smoothstep( lighting_params.z, lighting_params.w,
+                                          length( v_world - eye_pos.xyz ) );
+    if( sun_portal ) {
+        vec3 portal_tint = mix( vec3( 1.0 ), albedo, 0.35 );
+        float portal_day = clamp( atmosphere_sun.w, 0.0, 1.0 ) * cloud * portal_fade;
+        emission += sunlight_color.rgb * sunlight_color.w * bounce_params.z *
+                    portal_day * portal_tint;
+    }
     vec3 lit = albedo * ( ambient + direct ) + emission;
     out_color = vec4( apply_air_perspective( lit ), composite_alpha );
-    out_emissive = vec4( emission, ( flags & 16384 ) != 0 ? 1.0 : 0.0 );
+    float material_alpha = sun_portal ? -2.0 : ( ( flags & 16384 ) != 0 ? 1.0 : 0.0 );
+    out_emissive = vec4( emission, material_alpha );
 }
