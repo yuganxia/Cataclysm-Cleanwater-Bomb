@@ -6,6 +6,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 #include "atmosphere3d.glsl"
+#include "color3d.glsl"
 #include "memory_presets.glsl"
 #include "nightvision_presets.glsl"
 
@@ -38,17 +39,20 @@ layout(set = 3, binding = 0) uniform FragUBO {
     vec4 atmosphere_params; // x = cloud height, y = cloud scale, z = fog start, w = fog end
     vec4 atmosphere_origin; // xy = view center in map coordinates, z = storminess
     vec4 ao_params;     // x = enabled, y = strength, z = fade start, w = fade end
-    vec4 sunlight_color; // rgb = direct sun tint, w = direct-light gain
-    vec4 ambient_color;  // rgb = ambient tint, w = ambient-light gain
+    vec4 sunlight_color; // rgb = direct key tint, w = direct-light gain
+    vec4 ambient_color;  // rgb = sky hemisphere tint, w = ambient-light gain
+    vec4 ground_color;   // rgb = ground hemisphere tint
+    vec4 lighting_params; // x = night amount, y = local-light response,
+                          // z/w = shadow fade start/end in world units
 };
 
 layout(location = 0) in vec4 v_color;
 layout(location = 1) in vec2 v_uv;
 layout(location = 2) in float v_flags;
-layout(location = 3) in float v_shade;
+layout(location = 3) in vec3 v_normal;
 layout(location = 4) in vec3 v_world;
 layout(location = 5) in vec2 v_screen;
-layout(location = 6) in float v_sun;
+layout(location = 6) in float v_wrap;
 layout(location = 7) in vec3 v_tile;
 layout(location = 8) in vec4 v_emission;
 
@@ -66,20 +70,23 @@ const vec2 shadow_poisson[16] = vec2[](
     vec2( 0.19984126, 0.78641367 ), vec2( 0.14383161, -0.14100790 )
 );
 
-float sun_visibility()
+float sun_visibility( vec3 normal, vec3 light_dir )
 {
-    if( shadow_params.x < 0.5 || v_sun <= 0.0 ) {
+    float ndotl = max( dot( normal, light_dir ), 0.0 );
+    if( shadow_params.x < 0.5 || ndotl <= 0.001 ) {
         return 1.0;
     }
-    vec4 light_pos = light_vp * vec4( v_world, 1.0 );
+    // Move the receiver along its own normal before projecting.  Depth bias
+    // alone cannot remove acne on steep walls without also creating peter-panning.
+    float normal_offset = 0.018 + 0.045 * ( 1.0 - ndotl );
+    vec4 light_pos = light_vp * vec4( v_world + normal * normal_offset, 1.0 );
     vec3 ndc = light_pos.xyz / light_pos.w;
     vec2 uv = vec2( ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5 );
     if( uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 ||
         ndc.z < 0.0 || ndc.z > 1.0 ) {
         return 1.0;
     }
-    float ndotl = clamp( v_sun / 0.45, 0.0, 1.0 );
-    float bias = shadow_params.z * ( 1.0 + 2.0 * ( 1.0 - ndotl ) );
+    float bias = shadow_params.z * ( 1.0 + 3.0 * ( 1.0 - ndotl ) );
     float angle = fract( sin( dot( gl_FragCoord.xy, vec2( 12.9898, 78.233 ) ) ) *
                          43758.5453 ) * 6.28318530718;
     float cs = cos( angle );
@@ -116,13 +123,21 @@ float sun_visibility()
         float depth = texture( shadow_tex, sample_uv ).r;
         visible += ndc.z - filter_bias <= depth ? 1.0 : 0.0;
     }
-    return visible / 16.0;
+    visible /= 16.0;
+    float distance_fade = 1.0 - smoothstep( lighting_params.z, lighting_params.w,
+                                            length( v_world - eye_pos.xyz ) );
+    return mix( 1.0, visible, distance_fade );
 }
 
-vec3 light_hue()
+struct scene_light_sample {
+    float intensity;
+    vec3 hue;
+};
+
+scene_light_sample sample_scene_light()
 {
     if( light_params.x < 0.5 ) {
-        return vec3( 1.0 );
+        return scene_light_sample( 1.0, vec3( 1.0 ) );
     }
     int rows = int( light_params.y + 0.5 );
     int relative_z = int( floor( ( v_tile.z + 0.5 * light_params.w ) / light_params.w ) );
@@ -132,7 +147,7 @@ vec3 light_hue()
     int map_width = textureSize( light_tex, 0 ).x;
     if( own.x < 0 || own.x >= map_width || own.y < 0 || own.y >= rows ||
         layer < 0 || layer * rows >= textureSize( light_tex, 0 ).y ) {
-        return vec3( 1.0 );
+        return scene_light_sample( 1.0, vec3( 1.0 ) );
     }
     vec4 own_texel = texelFetch( light_tex, ivec2( own.x, layer * rows + own.y ), 0 );
     int own_flags = int( own_texel.a * 255.0 + 0.5 );
@@ -141,6 +156,7 @@ vec3 light_hue()
     ivec2 base = ivec2( floor( st ) );
     vec2 f = fract( st );
     vec3 chroma = vec3( 0.0 );
+    float intensity = 0.0;
     float weight_sum = 0.0;
     for( int y = 0; y <= 1; ++y ) {
         for( int x = 0; x <= 1; ++x ) {
@@ -157,19 +173,22 @@ vec3 light_hue()
                            ( y == 0 ? 1.0 - f.y : f.y );
             vec3 tap_chroma = vec3( t.g, t.b, max( 1.0 - t.g - t.b, 0.0 ) );
             chroma += weight * tap_chroma;
+            intensity += weight * t.r;
             weight_sum += weight;
         }
     }
     if( weight_sum < 1.0e-4 ) {
-        return vec3( 1.0 );
+        return scene_light_sample( own_texel.r, vec3( 1.0 ) );
     }
     chroma /= weight_sum;
-    return chroma / max( max( chroma.r, chroma.g ), max( chroma.b, 1.0e-4 ) );
+    intensity /= weight_sum;
+    vec3 hue = chroma / max( max( chroma.r, chroma.g ), max( chroma.b, 1.0e-4 ) );
+    return scene_light_sample( intensity, hue );
 }
 
 float cloud_sun_visibility()
 {
-    if( v_sun <= 0.0 || atmosphere_sun.z <= 0.05 || atmosphere_sun.w <= 0.05 ) {
+    if( atmosphere_sun.z <= 0.05 || atmosphere_sun.w <= 0.05 ) {
         return 1.0;
     }
     float low_coverage = 0.0;
@@ -324,22 +343,23 @@ void main()
         out_color = vec4( 0.0 );
         return;
     }
-    vec3 rgb = v_color.rgb * sampled.rgb;
-    // remembered terrain (bit6): 2D draws the map-memory overlay unlit, colored
-    // by MEMORY_MAP_MODE (a named preset or the custom RGB/gamma mixer), so the
-    // normal light tone and face shading do not apply
+    vec3 display_rgb = v_color.rgb * sampled.rgb;
+    vec3 normal = normalize( v_normal );
+    if( v_wrap > 0.0 && dot( normal, eye_pos.xyz - v_world ) < 0.0 ) {
+        normal = -normal;
+    }
+    vec3 light_dir = normalize( atmosphere_sun.xyz );
+    float nv_face_shade = 0.82 + 0.18 * max( dot( normal, light_dir ), 0.0 );
+    // remembered terrain (bit6): the map-memory palette is authored in display
+    // space.  Convert it to linear so the common post chain can present it.
     if( ( flags & 64 ) != 0 ) {
         vec3 mem = memory_params.y > 0.5
-                   ? memory_mixer( rgb, memory_dark.rgb, memory_light.rgb, memory_dark.w )
-                   : memory_preset( int( memory_params.x + 0.5 ), rgb );
-        out_color = vec4( mem, composite_alpha );
+                   ? memory_mixer( display_rgb, memory_dark.rgb, memory_light.rgb, memory_dark.w )
+                   : memory_preset( int( memory_params.x + 0.5 ), display_rgb );
+        out_color = vec4( color3d_srgb_to_linear( mem ), composite_alpha );
         return;
     }
-    // night vision goggles (NV_GREEN_TOGGLE): 2D's reference_night_rgb. the
-    // sprite color goes through the green ramp, dimmed by the tile light and
-    // handing over to the overexposed look past the light threshold; the sun
-    // face shade still shapes the surface. v_color.a carries the tile light in
-    // an NV frame instead of the saturation
+    // Night vision keeps its own reference palette and brightness hand-over.
     if( nv_params.x > 0.5 ) {
         vec3 base = textured ? sampled.rgb : v_color.rgb;
         float light = clamp( v_color.a, 0.0, 1.0 );
@@ -349,20 +369,39 @@ void main()
         vec3 dim = nightvision_green( night * mix( nv_params.y, 1.0, light ) );
         vec3 nv = mix( dim, nightvision_green( over ),
                        smoothstep( nv_params.z, 1.0, light ) );
-        out_color = vec4( nv * v_shade, composite_alpha );
+        out_color = vec4( color3d_srgb_to_linear( nv * nv_face_shade ), composite_alpha );
         return;
     }
-    rgb *= light_hue();
-    // low light drains color, as 2D's lit shader does; v_color.a carries the
-    // tile light's saturation (1 = full color, 0 = grayscale)
-    float gray = ( rgb.r + rgb.g + rgb.b ) / 3.0;
-    rgb = mix( vec3( gray ), rgb, v_color.a );
-    float direct_sun = v_sun * sunlight_color.w * sun_visibility() * cloud_sun_visibility();
-    vec3 ambient = ambient_color.rgb *
-                   ( ( v_shade - v_sun ) * ambient_color.w * ambient_occlusion() );
-    vec3 direct = sunlight_color.rgb * direct_sun;
-    vec3 emission = v_emission.rgb * ( textured ? sampled.rgb : vec3( 1.0 ) );
-    vec3 lit = apply_air_perspective( rgb * ( ambient + direct ) ) + emission;
-    out_color = vec4( lit, composite_alpha );
+
+    scene_light_sample scene_light = sample_scene_light();
+    // Retain chroma well into darkness; only genuinely near-black cells approach
+    // monochrome.  This is deliberately gentler than the 2D readability drain.
+    float color_retention = mix( 0.52, 1.0,
+                                 smoothstep( 0.0, 0.75, scene_light.intensity ) );
+    float display_luma = color3d_luminance( display_rgb );
+    display_rgb = mix( vec3( display_luma ), display_rgb, color_retention );
+    vec3 albedo = color3d_srgb_to_linear( display_rgb );
+
+    float ndotl = dot( normal, light_dir );
+    float diffuse = clamp( ( ndotl + v_wrap ) / ( 1.0 + v_wrap ), 0.0, 1.0 );
+    float shadow = sun_visibility( normal, light_dir );
+    float cloud = mix( cloud_sun_visibility(), 1.0 - 0.75 * atmosphere_wind.z,
+                       lighting_params.x );
+    float light_fill = mix( 0.12, 1.0, pow( clamp( scene_light.intensity, 0.0, 1.0 ), 0.70 ) );
+    // In daylight the sun owns outdoor surfaces and the shadow map owns indoor
+    // occlusion.  At night the continuous map light also gates the weak moon key.
+    float direct_fill = mix( 1.0, light_fill, lighting_params.x );
+    vec3 direct = sunlight_color.rgb * sunlight_color.w *
+                  ( diffuse * shadow * cloud * direct_fill );
+
+    float hemisphere = clamp( normal.z * 0.5 + 0.5, 0.0, 1.0 );
+    vec3 hemisphere_color = mix( ground_color.rgb, ambient_color.rgb, hemisphere );
+    vec3 local_tint = mix( vec3( 1.0 ), scene_light.hue, lighting_params.y );
+    vec3 ambient = hemisphere_color * ambient_color.w *
+                   ( ambient_occlusion() * light_fill ) * local_tint;
+    vec3 emission = v_emission.rgb *
+                    ( textured ? color3d_srgb_to_linear( sampled.rgb ) : vec3( 1.0 ) );
+    vec3 lit = albedo * ( ambient + direct ) + emission;
+    out_color = vec4( apply_air_perspective( lit ), composite_alpha );
     out_emissive = vec4( emission, ( flags & 16384 ) != 0 ? 1.0 : 0.0 );
 }

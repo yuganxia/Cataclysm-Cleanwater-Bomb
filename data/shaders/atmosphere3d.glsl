@@ -24,7 +24,7 @@ float atmosphere_fbm( vec2 p )
 
 vec3 atmosphere_horizon_color( float daylight )
 {
-    return mix( vec3( 0.008, 0.009, 0.018 ), vec3( 0.55, 0.66, 0.82 ),
+    return mix( vec3( 0.018, 0.028, 0.055 ), vec3( 0.46, 0.60, 0.78 ),
                 clamp( daylight, 0.0, 1.0 ) );
 }
 
@@ -32,7 +32,7 @@ vec3 atmosphere_fog_color( float daylight, float cloudiness )
 {
     vec3 fog_color = atmosphere_horizon_color( daylight );
     float gray = dot( fog_color, vec3( 0.25, 0.5, 0.25 ) );
-    return mix( fog_color, vec3( gray * 0.85 ), cloudiness * 0.45 );
+    return mix( fog_color, vec3( gray * 0.90 ), cloudiness * 0.38 );
 }
 
 vec2 atmosphere_cloud_coordinates( vec2 world_xy, vec2 map_origin, vec2 wind, float scale )

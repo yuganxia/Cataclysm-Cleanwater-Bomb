@@ -189,7 +189,8 @@ void main()
     float denominator = normal_half * normal_half * ( alpha_squared - 1.0 ) + 1.0;
     float distribution = alpha_squared /
                          max( 3.14159265 * denominator * denominator, 1.0e-5 );
-    float sun_visibility = clamp( sun_dir.w, 0.0, 1.0 ) * ( 1.0 - wind.z * 0.72 );
+    float sun_visibility = sun_dir.w < 0.0 ? 0.0 :
+                           max( clamp( sun_dir.w, 0.0, 1.0 ), 0.14 ) * ( 1.0 - wind.z * 0.72 );
     vec3 glint = sunlight_color.rgb * min( distribution * normal_light * 0.008, 8.0 ) *
                  sun_visibility;
     color += glint;

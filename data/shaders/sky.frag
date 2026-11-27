@@ -8,6 +8,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 #include "sky3d.glsl"
+#include "color3d.glsl"
 #include "nightvision_presets.glsl"
 
 layout(set = 3, binding = 0) uniform SkyUBO {
@@ -40,8 +41,8 @@ void main()
     // daylight takes the overexposed look, the same hand-over the map uses
     // (smooth_lighting::overexpose_start)
     if( params.w > 0.5 ) {
-        col = mix( nightvision_rgb( col ), overexposed_rgb( col ),
-                   smoothstep( 0.85, 1.0, daylight ) );
+        col = color3d_srgb_to_linear( mix( nightvision_rgb( col ), overexposed_rgb( col ),
+                                           smoothstep( 0.85, 1.0, daylight ) ) );
         sun_emission = vec3( 0.0 );
     }
     out_color = vec4( col, 1.0 );

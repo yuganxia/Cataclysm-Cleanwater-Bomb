@@ -1,6 +1,6 @@
 // Experimental 3D terrain renderer: instanced boxes / cross-quads / yaw-billboards,
-// textured from the tileset atlas.
-// SDL GPU vertex uniform buffers live in set 1.
+// textured from the tileset atlas.  Every geometry family exports a world normal;
+// the fragment shader owns the common art-directed lighting model.
 
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -13,7 +13,7 @@ layout(location = 2) in vec3 a_inst_pos;    // tile grid coords (player-relative
 layout(location = 3) in vec3 a_inst_scale;  // box/xquad: size in meters; billboard: x=width, y=height
 layout(location = 4) in vec2 a_inst_uv0;    // atlas uv, top-left
 layout(location = 5) in vec2 a_inst_uv1;    // atlas uv, bottom-right
-layout(location = 6) in vec4 a_inst_color;  // rgb = light tint
+layout(location = 6) in vec4 a_inst_color;  // rgb = tint / untextured fallback color
 layout(location = 7) in float a_inst_flags; // bit0: textured; bit1: no cutout; bit2-3: top uv rotation; bit4: side strip; bit8: silhouette side
 layout(location = 8) in float a_inst_pad;   // bit4 mode: strip v coordinate (sprite bottom edge)
 layout(location = 9) in vec4 a_inst_emission; // rgb = explicit light-source radiance
@@ -23,7 +23,7 @@ layout(set = 1, binding = 0) uniform UBO {
     vec4 cam_right;  // xyz: camera right on the ground plane (billboard facing)
     vec4 cam_up;     // xyz: world up (billboard facing)
     vec4 params;     // x = mode: 0 box, 1 static xquad, 2 yaw billboard, 3 cardinal-snapped billboard, 4 axis quad (fence), 5 flat horizontal quad
-    vec4 sun_dir;    // xyz = direction toward the sun (world), w = 1 when the sun is up
+    vec4 sun_dir;    // retained in the shared shadow/terrain vertex UBO layout
     vec4 water_vertex; // xy = map origin, z = seconds, w = wave height amplitude
     vec4 water_flow;   // xy = world wind direction, z = normalized speed
 };
@@ -31,10 +31,10 @@ layout(set = 1, binding = 0) uniform UBO {
 layout(location = 0) out vec4 v_color;
 layout(location = 1) out vec2 v_uv;
 layout(location = 2) out float v_flags;
-layout(location = 3) out float v_shade;
+layout(location = 3) out vec3 v_normal;
 layout(location = 4) out vec3 v_world;
 layout(location = 5) out vec2 v_screen;
-layout(location = 6) out float v_sun;
+layout(location = 6) out float v_wrap;
 layout(location = 7) out vec3 v_tile;
 layout(location = 8) out vec4 v_emission;
 
@@ -43,12 +43,11 @@ void main()
     int mode = int(params.x + 0.5);
     vec3 world;
     vec2 uv_local;
-    float shade;
-    float sun_shade = 0.0;
+    vec3 normal;
+    float wrap = 0.0;
     if( mode == 2 || mode == 3 ) {
-        // yaw billboard: rotate the bottom-centered quad around world-up to face
-        // the camera; mode 3 snaps the facing to the nearest cardinal axis so
-        // furniture steps in 90 degrees instead of rotating continuously
+        // Yaw billboard: rotate the bottom-centered quad around world-up to face
+        // the camera; mode 3 snaps the facing to the nearest cardinal axis.
         vec3 rgt = cam_right.xyz;
         if( mode == 3 ) {
             if( abs( rgt.x ) >= abs( rgt.y ) ) {
@@ -60,28 +59,29 @@ void main()
         world = a_inst_pos + rgt * ( a_pos.x * a_inst_scale.x )
               + cam_up.xyz * ( a_pos.y * a_inst_scale.y );
         uv_local = a_aux.xy;
-        shade = 0.95;
+        // A sprite has no real volume.  A slightly upward, camera-facing normal
+        // plus wrapped diffuse gives it the same key/fill language as the boxes
+        // without turning people and furniture into hard black cutouts.
+        normal = normalize( cross( cam_up.xyz, rgt ) + vec3( 0.0, 0.0, 0.30 ) );
+        wrap = 0.65;
     } else if( mode == 4 ) {
-        // flat vertical quad standing on a fixed axis (fences): a_inst_pad
-        // > 0.5 = runs N-S (quad spans y), else runs E-W (spans x)
+        // Flat vertical quad standing on a fixed axis (fences): a_inst_pad
+        // > 0.5 = runs N-S (quad spans y), else runs E-W (spans x).
         vec3 axis = a_inst_pad > 0.5 ? vec3( 0.0, 1.0, 0.0 ) : vec3( 1.0, 0.0, 0.0 );
         world = a_inst_pos + axis * ( a_pos.x * a_inst_scale.x )
               + cam_up.xyz * ( a_pos.y * a_inst_scale.y );
         int iflags = int( a_inst_flags + 0.5 );
         if( ( iflags & 256 ) != 0 ) {
-            // silhouette side following sprite v along its run; sprite u is
-            // the fixed edge-pixel column, independent of world rotation
             uv_local = vec2( a_aux.y, a_aux.x );
         } else {
             uv_local = a_aux.xy;
         }
-        shade = 0.95;
+        normal = a_inst_pad > 0.5 ? vec3( 1.0, 0.0, 0.12 ) : vec3( 0.0, 1.0, 0.12 );
+        normal = normalize( normal );
+        wrap = 0.40;
     } else if( mode == 5 ) {
-        // flat horizontal quad (floor overlays, cutout floor tiles): no
-        // thickness, so no side faces that would sample transparent sprite rows
+        // Flat horizontal quad (floor overlays, cutout floor tiles).
         world = a_inst_pos + vec3( a_pos.x * a_inst_scale.x, a_pos.y * a_inst_scale.y, 0.0 );
-        // same quarter-turn UV rotation as a box top face: 2D rotates a
-        // single-sprite connection tile by rota % 4
         int iflags = int( a_inst_flags + 0.5 );
         int rota = ( iflags >> 2 ) & 3;
         vec2 q = a_pos.xy;
@@ -93,26 +93,24 @@ void main()
             q = vec2( 1.0 - q.y, q.x );
         }
         uv_local = q;
-        // same sun shading as a box top face (normal = +z)
-        vec3 light_dir = sun_dir.w > 0.5 ? normalize( sun_dir.xyz )
-                         : normalize( vec3( 0.4, 0.3, 0.85 ) );
-        float ndotl = max( light_dir.z, 0.0 );
-        shade = 0.55 + 0.45 * ndotl;
-        sun_shade = sun_dir.w > 0.5 ? 0.45 * ndotl : 0.0;
+        normal = vec3( 0.0, 0.0, 1.0 );
     } else if( mode == 1 ) {
-        // static crossed quad pair; uv comes from the vertex
+        // Static crossed quad pair.  The diagonal identifies which of the two
+        // planes owns the vertex; a little upward tilt keeps foliage open to sky.
         world = a_inst_pos + a_pos * a_inst_scale;
         uv_local = a_aux.xy;
-        shade = 0.95;
+        normal = abs( a_pos.x - a_pos.y ) < 0.5
+                 ? vec3( 0.7071, -0.7071, 0.20 ) : vec3( 0.7071, 0.7071, 0.20 );
+        normal = normalize( normal );
+        wrap = 0.55;
     } else {
-        // box: derive face-local uv from the corner position and the face normal
+        // Box: derive face-local uv from the corner position and the face normal.
         world = a_inst_pos + a_pos * a_inst_scale;
         vec3 n = a_aux;
+        normal = n;
         int iflags = int( a_inst_flags + 0.5 );
         int rota = ( iflags >> 2 ) & 3;
         if( abs( n.z ) > 0.5 ) {
-            // top/bottom face: quarter-turn rotation around the tile center
-            // (multitile connection orientation, e.g. pool edges, fences)
             vec2 q = a_pos.xy;
             if( rota == 1 ) {
                 q = vec2( q.y, 1.0 - q.x );
@@ -126,14 +124,10 @@ void main()
             float su = ( abs( n.y ) > 0.5 ) ? a_pos.x : a_pos.y;
             float sv = 1.0 - a_pos.z;
             if( ( iflags & 16 ) != 0 ) {
-                // side faces: a horizontal color strip near the sprite's bottom
-                // edge instead of the whole sprite stretched over the face
                 sv = ( a_inst_pad - a_inst_uv0.y ) / max( a_inst_uv1.y - a_inst_uv0.y, 1e-6 );
             }
             uv_local = vec2( su, sv );
             if( ( iflags & 32 ) != 0 ) {
-                // fence slab: the wide side faces show the (canonically N-S
-                // drawn) sprite rotated 90 degrees as a frontal fence view
                 bool wide = ( abs( n.y ) > 0.5 && a_inst_scale.x >= a_inst_scale.y ) ||
                             ( abs( n.x ) > 0.5 && a_inst_scale.y > a_inst_scale.x );
                 if( wide ) {
@@ -141,13 +135,6 @@ void main()
                 }
             }
         }
-        // sun-lit faces: real sun direction while the sun is up, fixed
-        // up-south-east fallback at night so faces stay readable
-        vec3 light_dir = sun_dir.w > 0.5 ? normalize( sun_dir.xyz )
-                         : normalize( vec3( 0.4, 0.3, 0.85 ) );
-        float diff = max( dot( n, light_dir ), 0.0 );
-        shade = 0.55 + 0.45 * diff;
-        sun_shade = sun_dir.w > 0.5 ? 0.45 * diff : 0.0;
     }
     int water_flags = int( a_inst_flags + 0.5 );
     if( water_vertex.w > 0.0 && ( water_flags & 16384 ) != 0 &&
@@ -156,7 +143,8 @@ void main()
                                       water_vertex.z, water_vertex.w, water_flow.z );
     }
     v_tile = a_inst_pos;
-    v_sun = sun_shade;
+    v_normal = normal;
+    v_wrap = wrap;
     v_world = world;
     gl_Position = mvp * vec4( world, 1.0 );
     vec2 ndc = gl_Position.xy / gl_Position.w;
@@ -169,6 +157,5 @@ void main()
         out_flags &= ~16384;
     }
     v_flags = float( out_flags );
-    v_shade = shade;
     v_emission = a_inst_emission;
 }

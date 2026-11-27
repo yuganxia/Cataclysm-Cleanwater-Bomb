@@ -150,6 +150,7 @@ constexpr int INSTANCE_STRIDE = 80;
 
 constexpr float LEVEL_HEIGHT = 2.6f;
 constexpr int SHADOW_MAP_SIZE = 2048;
+constexpr int BLOOM_LEVEL_COUNT = 5;
 constexpr int LIGHT_TEXTURE_WIDTH = MAPSIZE_X;
 constexpr int LIGHT_TEXTURE_HEIGHT = MAPSIZE_Y * OVERMAP_LAYERS;
 constexpr size_t LIGHT_LAYER_BYTES = static_cast<size_t>( MAPSIZE_X ) * MAPSIZE_Y *
@@ -639,7 +640,7 @@ struct frame_slot {
     SDL_GPUTexture *hdr_tex = nullptr;
     SDL_GPUTexture *water_tex = nullptr;
     SDL_GPUTexture *emissive_tex = nullptr;
-    std::array<SDL_GPUTexture *, 2> bloom_tex{};
+    std::array<std::array<SDL_GPUTexture *, 2>, BLOOM_LEVEL_COUNT> bloom_tex{};
     SDL_GPUTexture *depth_tex = nullptr;
     SDL_GPUTexture *ao_raw_tex = nullptr;
     SDL_GPUTexture *ao_tex = nullptr;
@@ -654,6 +655,7 @@ struct frame_slot {
     bool weather_mask_valid = false;
     std::array<uint64_t, OVERMAP_LAYERS> light_generations{};
     bool light_tint = true;
+    float light_vision_threshold = -1.0f;
     SDL_GPUBuffer *instance_vb = nullptr;
     size_t instance_vb_size = 0;
     SDL_GPUTransferBuffer *instance_tb = nullptr;
@@ -1061,10 +1063,12 @@ void context::teardown()
                 SDL_ReleaseGPUTexture( device, slot.emissive_tex );
                 slot.emissive_tex = nullptr;
             }
-            for( SDL_GPUTexture *&bloom : slot.bloom_tex ) {
-                if( bloom ) {
-                    SDL_ReleaseGPUTexture( device, bloom );
-                    bloom = nullptr;
+            for( auto &level : slot.bloom_tex ) {
+                for( SDL_GPUTexture *&bloom : level ) {
+                    if( bloom ) {
+                        SDL_ReleaseGPUTexture( device, bloom );
+                        bloom = nullptr;
+                    }
                 }
             }
             if( slot.depth_tex ) {
@@ -1260,10 +1264,12 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
             SDL_ReleaseGPUTexture( g_ctx.device, slot.emissive_tex );
             slot.emissive_tex = nullptr;
         }
-        for( SDL_GPUTexture *&bloom : slot.bloom_tex ) {
-            if( bloom ) {
-                SDL_ReleaseGPUTexture( g_ctx.device, bloom );
-                bloom = nullptr;
+        for( auto &level : slot.bloom_tex ) {
+            for( SDL_GPUTexture *&bloom : level ) {
+                if( bloom ) {
+                    SDL_ReleaseGPUTexture( g_ctx.device, bloom );
+                    bloom = nullptr;
+                }
             }
         }
         if( slot.depth_tex ) {
@@ -1366,6 +1372,7 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
         }
         slot.light_generations.fill( std::numeric_limits<uint64_t>::max() );
         slot.light_tint = true;
+        slot.light_vision_threshold = -1.0f;
 
         ci.format = SDL_GPU_TEXTUREFORMAT_R8_UNORM;
         ci.width = MAPSIZE_X;
@@ -1391,11 +1398,18 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
             write_status( "GTAO textures unavailable; ambient occlusion disabled" );
         }
         ci.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
-        for( SDL_GPUTexture *&bloom : slot.bloom_tex ) {
-            bloom = SDL_CreateGPUTexture( g_ctx.device, &ci );
+        bool bloom_ok = true;
+        for( int level = 0; level < BLOOM_LEVEL_COUNT; ++level ) {
+            const int divisor = 1 << ( level + 1 );
+            ci.width = static_cast<Uint32>( std::max( 1, ( w + divisor - 1 ) / divisor ) );
+            ci.height = static_cast<Uint32>( std::max( 1, ( h + divisor - 1 ) / divisor ) );
+            for( SDL_GPUTexture *&bloom : slot.bloom_tex[level] ) {
+                bloom = SDL_CreateGPUTexture( g_ctx.device, &ci );
+                bloom_ok = bloom_ok && bloom;
+            }
         }
-        if( !slot.bloom_tex[0] || !slot.bloom_tex[1] ) {
-            write_status( "Bloom ping-pong textures unavailable; Bloom disabled" );
+        if( !bloom_ok ) {
+            write_status( "Bloom mip-chain textures unavailable; Bloom disabled" );
         }
 
         SDL_PropertiesID props = SDL_CreateProperties();
@@ -1423,15 +1437,17 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
     return true;
 }
 
-bool upload_light_hue( SDL_GPUCommandBuffer *cmd, frame_slot &slot, map &here )
+bool upload_scene_light( SDL_GPUCommandBuffer *cmd, frame_slot &slot, map &here )
 {
     if( !slot.light_tex || !slot.light_tb ) {
         return false;
     }
     const bool tint = get_option<bool>( "COLORED_LIGHTING" );
-    if( slot.light_tint != tint ) {
+    const float vision_threshold = here.get_visibility_variables_cache().vision_threshold;
+    if( slot.light_tint != tint || slot.light_vision_threshold != vision_threshold ) {
         slot.light_generations.fill( std::numeric_limits<uint64_t>::max() );
         slot.light_tint = tint;
+        slot.light_vision_threshold = vision_threshold;
     }
     bool any_update = false;
     for( int z = -OVERMAP_DEPTH; z <= OVERMAP_HEIGHT; ++z ) {
@@ -1461,12 +1477,30 @@ bool upload_light_hue( SDL_GPUCommandBuffer *cmd, frame_slot &slot, map &here )
         }
         for( int y = 0; y < MAPSIZE_Y; ++y ) {
             for( int x = 0; x < MAPSIZE_X; ++x ) {
-                const std::array<float, 3> hue = tint && cache.has_colored_lights
-                                                 ? smooth_lighting::illumination_hue( cache.light_color_cache[x][y],
-                                                         cache.lm[x][y].max() )
-                                                 : white;
+                std::array<float, 3> hue = tint && cache.has_colored_lights
+                                           ? smooth_lighting::illumination_hue( cache.light_color_cache[x][y],
+                                                   cache.lm[x][y].max() )
+                                           : white;
+                const float scalar_light = cache.lm[x][y].max();
+                // The light map already contains smooth source falloff.  Upload
+                // that energy instead of forcing every texel to full brightness;
+                // visibility and map memory remain independent display gates.
+                const float light = smooth_lighting::light_above_threshold(
+                                        scalar_light, vision_threshold );
+                if( tint && hue == white && cache.natural_light_level_cache < LIGHT_AMBIENT_LIT ) {
+                    // Uncolored artificial sources get a restrained tungsten
+                    // warmth.  Natural night fill stays cool, and explicitly
+                    // colored lights keep their authored hue.
+                    const float natural = cache.outside_cache[x][y]
+                                          ? cache.natural_light_level_cache : LIGHT_AMBIENT_LOW;
+                    const float artificial = std::max( 0.0f, scalar_light - natural );
+                    const float warmth = std::clamp( 1.6f * artificial / LIGHT_AMBIENT_LIT,
+                                                     0.0f, 1.0f );
+                    hue[1] = 1.0f - 0.20f * warmth;
+                    hue[2] = 1.0f - 0.38f * warmth;
+                }
                 const bool barrier = cache.transparency_cache[x][y] <= LIGHT_TRANSPARENCY_SOLID;
-                pixels[x + y * MAPSIZE_X] = smooth_lighting::encode_light_texel( { 1.0f, true }, hue,
+                pixels[x + y * MAPSIZE_X] = smooth_lighting::encode_light_texel( { light, true }, hue,
                                             barrier );
             }
         }
@@ -1870,16 +1904,16 @@ bool probe( SDL_Renderer *renderer )
     }
 
     SDL_GPUShader *post_vs = load_shader( device, "post3d.vert", SDL_GPU_SHADERSTAGE_VERTEX, 0 );
-    SDL_GPUShader *post_fs = load_shader( device, "tonemap3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 2 );
+    SDL_GPUShader *post_fs = load_shader( device, "tonemap3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
     SDL_GPUShader *gtao_fs = load_shader( device, "gtao3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
     SDL_GPUShader *ao_blur_fs = load_shader( device, "gtao3d_blur.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 0,
                                  1 );
     SDL_GPUShader *bloom_extract_fs = load_shader( device, "bloom3d_extract.frag",
-                                      SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 1 );
+                                      SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 2 );
     SDL_GPUShader *bloom_blur_fs = load_shader( device, "bloom3d_blur.frag",
                                     SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
     SDL_GPUShader *post_bloom_fs = load_shader( device, "tonemap3d_bloom.frag",
-                                   SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 2 );
+                                   SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 6 );
     SDL_GPUShader *water_fs = load_shader( device, "water3d.frag",
                                            SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 3 );
     SDL_GPUShader *precipitation_vs = load_shader( device, "precipitation3d.vert",
@@ -3369,11 +3403,10 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
         const lit_level ll = c.visibility_cache[q.x()][q.y()];
         return ll == lit_level::LOW || ll == lit_level::LIT || ll == lit_level::BRIGHT;
     };
-    // per-tile light tone, the same model 2D's smooth lighting uses
-    // (smooth_lighting::classify_light_cell + data/shaders/lit.frag): light is
-    // 0 at the vision threshold and 1 at LIGHT_AMBIENT_LIT; brightness bottoms
-    // out at shadow_shade and color drains to gray below full_color_light.
-    // every instance on a tile shares this tone.
+    // Night vision keeps the classic per-tile light value expected by its
+    // reference palette.  Ordinary 3D instances stay untone-mapped here: the
+    // fragment shader samples continuous map light per pixel instead, avoiding
+    // a second tile-quantized brightness multiply.
     struct tile_tone {
         float shade = 1.0f;   // brightness multiplier
         // 1 = full color, 0 = grayscale; in a night vision frame this slot
@@ -3382,11 +3415,13 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
     };
     const bool nv_tint = nv_tint_active();
     const auto tone_from_light = [nv_tint]( const float light ) {
-        const float t = std::clamp( light / smooth_lighting::full_color_light, 0.0f, 1.0f );
-        return tile_tone{
-            smooth_lighting::shadow_shade +
-            ( 1.0f - smooth_lighting::shadow_shade ) *light,
-            nv_tint ? std::clamp( light, 0.0f, 1.0f ) : t *t *( 3.0f - 2.0f * t ) };
+        const float shade = smooth_lighting::shadow_shade +
+                            ( 1.0f - smooth_lighting::shadow_shade ) * light;
+        // Ordinary 3D lighting reads the continuous per-pixel light texture.
+        // Keep the classic per-tile tone only for night vision, whose reference
+        // palette explicitly consumes the tile light through instance alpha.
+        return tile_tone{ nv_tint ? shade : 1.0f,
+                          nv_tint ? std::clamp( light, 0.0f, 1.0f ) : 1.0f };
     };
     const visibility_variables &vis_vars = here.get_visibility_variables_cache();
     // upper levels are not refreshed by update_visibility_cache (it stops at
@@ -4267,9 +4302,9 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                 if( open_air && !ovp ) {
                     continue;
                 }
-                // the whole tile shares one light tone, from the same light
-                // level classification 2D uses: bright tiles stay full color,
-                // dim ones darken and drain toward grayscale
+                // Visibility still comes from the game's classification.  Only
+                // night vision carries its classic tile tone into the instance;
+                // ordinary lighting is sampled continuously in the fragment.
                 const tile_tone tone = tone_for( cache, p, ll, wall_only );
 
                 const snow_cover snow = get_weather_const().get_surface_snow_cover( here, p );
@@ -6803,10 +6838,15 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
                          3.14159265f / 180.0f;
     const float sun_alt = static_cast<float>( units::to_degrees( sun_aa.second ) ) *
                           3.14159265f / 180.0f;
-    const vec3 sun_dir{ -std::sin( sun_az ) *std::cos( sun_alt ),
-                        std::cos( sun_az ) *std::cos( sun_alt ),
-                        std::sin( sun_alt ) };
     const bool sun_up = sun_alt > 0.0f && daylight > 0.05f;
+    // One art-directed key rig feeds terrain, sky and water.  Preserve the
+    // calendar's azimuth and day/night phase, but avoid flat noon top-light and
+    // below-horizon normals at night.  This changes display only.
+    const float visual_sun_alt = sun_up ? std::clamp( sun_alt, 0.38f, 0.82f ) : 0.48f;
+    const float visual_sun_az = sun_up ? sun_az : sun_az + 3.14159265f;
+    const vec3 sun_dir{ -std::sin( visual_sun_az ) * std::cos( visual_sun_alt ),
+                        std::cos( visual_sun_az ) * std::cos( visual_sun_alt ),
+                        std::sin( visual_sun_alt ) };
     const float shadow_extent = std::clamp( g_cam_dist * 2.2f, 32.0f, 72.0f );
     const vec3 light_eye{ target.x + sun_dir.x * 80.0f,
                           target.y + sun_dir.y * 80.0f,
@@ -7133,7 +7173,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     water_ub.cam_up = sky_ub.cam_up;
     water_ub.cam_forward = sky_ub.cam_forward;
     water_ub.sun_dir = sky_ub.sun_dir;
-    water_ub.sun_dir[3] = center.z() < 0 ? 0.0f : daylight;
+    water_ub.sun_dir[3] = center.z() < 0 ? -1.0f : daylight;
     water_ub.ray_params = { std::tan( g_fov_y * 0.5f ), g_aspect, camera_near, camera_far };
     water_ub.wind = { sky_ub.wind[0], sky_ub.wind[1], cloudiness, storminess };
     water_ub.cloud_mapping = sky_ub.cloud_mapping;
@@ -7176,8 +7216,10 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> ao_params;
         std::array<float, 4> sunlight_color;
         std::array<float, 4> ambient_color;
+        std::array<float, 4> ground_color;
+        std::array<float, 4> lighting_params;
     };
-    static_assert( sizeof( frag_uniforms ) == 26 * 16, "terrain3d fragment UBO must match std140" );
+    static_assert( sizeof( frag_uniforms ) == 28 * 16, "terrain3d fragment UBO must match std140" );
     frag_uniforms frag_ub{};
     const tripoint_bub_ms upos = get_avatar().pos_bub();
     const float player_gz = ( upos.z() - center.z() ) * LEVEL_HEIGHT;
@@ -7230,17 +7272,43 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     frag_ub.atmosphere_origin = { static_cast<float>( center.x() ), static_cast<float>( center.y() ),
                                   storminess, 0.0f
                                 };
-    frag_ub.ao_params = { 0.0f, 0.7f, 60.0f, 140.0f };
-    const float low_sun = sun_up ? std::clamp( 1.0f - sun_alt / 0.65f, 0.0f, 1.0f ) : 0.0f;
-    frag_ub.sunlight_color = sun_up
-                             ? std::array<float, 4> { 1.0f, 0.92f - 0.10f * low_sun,
-                                     0.78f - 0.18f * low_sun, 1.65f
+    frag_ub.ao_params = { 0.0f, 0.58f, 60.0f, 140.0f };
+    const bool above_ground = center.z() >= 0;
+    const bool day_key = sun_up && above_ground;
+    const float low_sun = day_key ? std::clamp( 1.0f - sun_alt / 0.65f, 0.0f, 1.0f ) : 0.0f;
+    const float night_amount = day_key ? std::clamp( 1.0f - daylight * 2.0f, 0.0f, 1.0f ) : 1.0f;
+    const float cloud_key_loss = 1.0f - 0.48f * cloudiness;
+    frag_ub.sunlight_color = day_key
+                             ? std::array<float, 4> { 1.0f, 0.92f - 0.27f * low_sun,
+                                     0.78f - 0.40f * low_sun,
+                                     ( 1.10f + 1.15f * daylight ) * cloud_key_loss
                                                     }
-                             : std::array<float, 4> { 1.0f, 1.0f, 1.0f, 1.0f };
-    frag_ub.ambient_color = sun_up
-                            ? std::array<float, 4> { 0.80f, 0.88f, 1.0f, 0.78f }
-                            : std::array<float, 4> { 1.0f, 1.0f, 1.0f, 1.0f };
+                             : std::array<float, 4> { 0.42f, 0.54f, 0.86f, 0.22f };
+    frag_ub.ambient_color = day_key
+                            ? std::array<float, 4> { 0.48f, 0.62f, 0.88f,
+                                    0.68f + 0.10f * cloudiness
+                                                   }
+                            : std::array<float, 4> { 0.20f, 0.28f, 0.46f, 0.78f };
+    frag_ub.ground_color = day_key
+                           ? std::array<float, 4> { 0.28f, 0.24f, 0.18f, 0.0f }
+                           : std::array<float, 4> { 0.065f, 0.075f, 0.12f, 0.0f };
+    frag_ub.lighting_params = { night_amount, 0.85f, 45.0f, 95.0f };
     water_ub.sunlight_color = frag_ub.sunlight_color;
+
+    struct post_uniforms {
+        std::array<float, 4> look;
+        std::array<float, 4> shadow_color;
+        std::array<float, 4> highlight_color;
+        std::array<float, 4> presentation;
+    };
+    static_assert( sizeof( post_uniforms ) == 4 * 16, "post fragment UBO must match std140" );
+    post_uniforms post_ub{};
+    post_ub.look = { day_key ? 0.95f + 0.05f * cloudiness : 1.12f,
+                     1.07f, 1.035f, nv_tint ? 1.0f : 0.0f
+                   };
+    post_ub.shadow_color = { 0.92f, 0.97f, 1.08f, 0.42f };
+    post_ub.highlight_color = { 1.04f, 1.00f, 0.94f, 0.32f };
+    post_ub.presentation = { 0.07f, 0.65f, 0.0f, 0.0f };
 
     struct gtao_uniforms {
         std::array<float, 4> cam_right;
@@ -7257,7 +7325,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     gtao_ub.cam_forward = sky_ub.cam_forward;
     gtao_ub.proj_params = { std::tan( g_fov_y * 0.5f ), g_aspect, camera_near, camera_far };
     gtao_ub.screen_params = { static_cast<float>( w ), static_cast<float>( h ), 0.0f, 0.0f };
-    gtao_ub.ao_params = { 2.4f, 4.0f, 1.35f, 0.0f };
+    gtao_ub.ao_params = { 1.65f, 2.5f, 1.12f, 0.0f };
 
     struct precipitation_uniforms {
         mat4 view_proj;
@@ -7316,8 +7384,8 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         return;
     }
 
-    const bool light_hue_ready = upload_light_hue( cmd, slot, here );
-    frag_ub.light_params[0] = light_hue_ready && get_option<bool>( "COLORED_LIGHTING" ) ? 1.0f : 0.0f;
+    const bool scene_light_ready = upload_scene_light( cmd, slot, here );
+    frag_ub.light_params[0] = scene_light_ready ? 1.0f : 0.0f;
     const float precipitation_strength = weather_state.rain + weather_state.snow;
     const bool precipitation_requested = !nv_tint && center.z() >= 0 &&
                                          precipitation_strength > 0.001f &&
@@ -7335,8 +7403,11 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     const bool mrt_ready = slot.emissive_tex && g_ctx.pipeline_mrt &&
                            g_ctx.pipeline_decal_mrt &&
                            ( !g_ctx.sky_pipeline || g_ctx.sky_mrt_pipeline );
-    const bool bloom_ready = !nv_tint_active() && mrt_ready &&
-                             slot.bloom_tex[0] && slot.bloom_tex[1] &&
+    bool bloom_targets_ready = true;
+    for( const auto &level : slot.bloom_tex ) {
+        bloom_targets_ready = bloom_targets_ready && level[0] && level[1];
+    }
+    const bool bloom_ready = !nv_tint_active() && mrt_ready && bloom_targets_ready &&
                              g_ctx.bloom_extract_pipeline && g_ctx.bloom_blur_pipeline &&
                              g_ctx.post_bloom_pipeline && g_ctx.linear_sampler;
     const bool water_ready = !nv_tint_active() && mrt_ready && slot.water_tex &&
@@ -7515,7 +7586,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
             sampler_binds[0].sampler = g_ctx.sampler;
             sampler_binds[1].texture = shadows_ready ? slot.shadow_tex : g_ctx.fallback_tex;
             sampler_binds[1].sampler = shadows_ready ? g_ctx.shadow_sampler : g_ctx.sampler;
-            sampler_binds[2].texture = light_hue_ready ? slot.light_tex : g_ctx.fallback_tex;
+            sampler_binds[2].texture = scene_light_ready ? slot.light_tex : g_ctx.fallback_tex;
             sampler_binds[2].sampler = g_ctx.sampler;
             sampler_binds[3].texture = g_ctx.fallback_tex;
             sampler_binds[3].sampler = g_ctx.linear_sampler;
@@ -7623,7 +7694,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         sampler_binds[0].sampler = g_ctx.sampler;
         sampler_binds[1].texture = shadows_ready ? slot.shadow_tex : g_ctx.fallback_tex;
         sampler_binds[1].sampler = shadows_ready ? g_ctx.shadow_sampler : g_ctx.sampler;
-        sampler_binds[2].texture = light_hue_ready ? slot.light_tex : g_ctx.fallback_tex;
+        sampler_binds[2].texture = scene_light_ready ? slot.light_tex : g_ctx.fallback_tex;
         sampler_binds[2].sampler = g_ctx.sampler;
         sampler_binds[3].texture = ao_ready ? slot.ao_tex : g_ctx.fallback_tex;
         sampler_binds[3].sampler = ao_ready ? g_ctx.linear_sampler : g_ctx.sampler;
@@ -7726,47 +7797,55 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         SDL_EndGPURenderPass( water_pass );
     }
 
-    int bloom_source = 0;
     if( bloom_ready ) {
         SDL_GPUColorTargetInfo extract_target{};
-        extract_target.texture = slot.bloom_tex[0];
+        extract_target.texture = slot.bloom_tex[0][0];
         extract_target.load_op = SDL_GPU_LOADOP_CLEAR;
         extract_target.store_op = SDL_GPU_STOREOP_STORE;
         extract_target.clear_color = { 0.0f, 0.0f, 0.0f, 1.0f };
         SDL_GPURenderPass *extract_pass = SDL_BeginGPURenderPass( cmd, &extract_target, 1, nullptr );
         SDL_BindGPUGraphicsPipeline( extract_pass, g_ctx.bloom_extract_pipeline );
-        SDL_GPUTextureSamplerBinding emissive_sampler{};
-        emissive_sampler.texture = slot.emissive_tex;
-        emissive_sampler.sampler = g_ctx.linear_sampler;
-        SDL_BindGPUFragmentSamplers( extract_pass, 0, &emissive_sampler, 1 );
+        SDL_GPUTextureSamplerBinding extract_samplers[2]{};
+        extract_samplers[0].texture = water_ready ? slot.water_tex : slot.hdr_tex;
+        extract_samplers[0].sampler = g_ctx.linear_sampler;
+        extract_samplers[1].texture = slot.emissive_tex;
+        extract_samplers[1].sampler = g_ctx.linear_sampler;
+        SDL_BindGPUFragmentSamplers( extract_pass, 0, extract_samplers, 2 );
         SDL_DrawGPUPrimitives( extract_pass, 3, 1, 0, 0 );
         SDL_EndGPURenderPass( extract_pass );
 
-        const float bloom_w = static_cast<float>( ( w + 1 ) / 2 );
-        const float bloom_h = static_cast<float>( ( h + 1 ) / 2 );
-        for( int round = 0; round < 2; ++round ) {
+        // Each level ends in slot [0].  The next level downsamples it with a
+        // separable Gaussian through slot [1], producing a compact bright core
+        // and a broad, faint halo without adding an upsample pipeline.
+        for( int level = 0; level < BLOOM_LEVEL_COUNT; ++level ) {
+            const int source_divisor = 1 << ( level + 1 );
+            const float source_w = static_cast<float>( std::max( 1, ( w + source_divisor - 1 ) /
+                                                   source_divisor ) );
+            const float source_h = static_cast<float>( std::max( 1, ( h + source_divisor - 1 ) /
+                                                   source_divisor ) );
             for( int axis = 0; axis < 2; ++axis ) {
-                const int bloom_target = 1 - bloom_source;
+                const int target_index = axis == 0 ? 1 : 0;
                 SDL_GPUColorTargetInfo blur_target{};
-                blur_target.texture = slot.bloom_tex[bloom_target];
+                blur_target.texture = slot.bloom_tex[level][target_index];
                 blur_target.load_op = SDL_GPU_LOADOP_CLEAR;
                 blur_target.store_op = SDL_GPU_STOREOP_STORE;
                 blur_target.clear_color = { 0.0f, 0.0f, 0.0f, 1.0f };
                 SDL_GPURenderPass *blur_pass = SDL_BeginGPURenderPass( cmd, &blur_target, 1, nullptr );
                 SDL_BindGPUGraphicsPipeline( blur_pass, g_ctx.bloom_blur_pipeline );
                 SDL_GPUTextureSamplerBinding blur_sampler{};
-                blur_sampler.texture = slot.bloom_tex[bloom_source];
+                blur_sampler.texture = axis == 0
+                                       ? ( level == 0 ? slot.bloom_tex[0][0] : slot.bloom_tex[level - 1][0] )
+                                       : slot.bloom_tex[level][1];
                 blur_sampler.sampler = g_ctx.linear_sampler;
                 SDL_BindGPUFragmentSamplers( blur_pass, 0, &blur_sampler, 1 );
                 const std::array<float, 4> blur_params = {
-                    axis == 0 ? 1.0f / bloom_w : 0.0f,
-                    axis == 1 ? 1.0f / bloom_h : 0.0f,
-                    round == 0 ? 1.0f : 2.0f, 0.0f
+                    axis == 0 ? 1.0f / source_w : 0.0f,
+                    axis == 1 ? 1.0f / source_h : 0.0f,
+                    1.0f, 0.0f
                 };
                 SDL_PushGPUFragmentUniformData( cmd, 0, blur_params.data(), sizeof( blur_params ) );
                 SDL_DrawGPUPrimitives( blur_pass, 3, 1, 0, 0 );
                 SDL_EndGPURenderPass( blur_pass );
-                bloom_source = bloom_target;
             }
         }
     }
@@ -7779,12 +7858,16 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     SDL_GPURenderPass *post_pass = SDL_BeginGPURenderPass( cmd, &post_target, 1, nullptr );
     SDL_BindGPUGraphicsPipeline( post_pass,
                                  bloom_ready ? g_ctx.post_bloom_pipeline : g_ctx.post_pipeline );
-    SDL_GPUTextureSamplerBinding post_samplers[2]{};
+    std::array<SDL_GPUTextureSamplerBinding, 1 + BLOOM_LEVEL_COUNT> post_samplers{};
     post_samplers[0].texture = water_ready ? slot.water_tex : slot.hdr_tex;
     post_samplers[0].sampler = g_ctx.sampler;
-    post_samplers[1].texture = bloom_ready ? slot.bloom_tex[bloom_source] : post_samplers[0].texture;
-    post_samplers[1].sampler = g_ctx.linear_sampler;
-    SDL_BindGPUFragmentSamplers( post_pass, 0, post_samplers, 2 );
+    for( int level = 0; level < BLOOM_LEVEL_COUNT; ++level ) {
+        post_samplers[level + 1].texture = slot.bloom_tex[level][0];
+        post_samplers[level + 1].sampler = g_ctx.linear_sampler;
+    }
+    SDL_BindGPUFragmentSamplers( post_pass, 0, post_samplers.data(),
+                                 bloom_ready ? 1 + BLOOM_LEVEL_COUNT : 1 );
+    SDL_PushGPUFragmentUniformData( cmd, 0, &post_ub, sizeof( post_ub ) );
     SDL_DrawGPUPrimitives( post_pass, 3, 1, 0, 0 );
     SDL_EndGPURenderPass( post_pass );
 
