@@ -10,6 +10,7 @@ layout(set = 1, binding = 0) uniform PrecipUBO {
     vec4 mask_mapping;
     vec4 cam_right;
     vec4 cam_up;
+    vec4 height_mapping;
 };
 
 layout(location = 0) out vec3 v_world;

@@ -506,6 +506,12 @@ void mapbuffer::save_quad(
     // for this step of just checking if the quad exists approaches 70% of the
     // total cost of saving the mapbuffer, in one test save I had.
     if( storage().compressed() ) {
+        // Direct column eviction can save a generated distant OMT before the
+        // world's first full save has created its map directory tree.
+        if( !assure_dir_exist( dirname ) ) {
+            throw std::runtime_error( "Failed creating map archive directory " +
+                                      dirname.get_unrelative_path().generic_u8string() );
+        }
         z = zzip::load( zzip_name.get_unrelative_path(),
                         storage().dictionary().get_unrelative_path() );
         if( !z ) {

@@ -162,6 +162,7 @@ class submap
         }
 
         void set_grade( const point_sm_ms &p, graded_surface grade ) {
+            geometry_version_.changed();
             ensure_nonuniform();
             surface_grades.insert_or_assign( p, grade );
         }

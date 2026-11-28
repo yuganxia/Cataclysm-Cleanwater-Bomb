@@ -68,6 +68,7 @@
 #include "monster.h"
 #include "mtype.h"
 #include "mutation.h"
+#include "north_america_elevation.h"
 #include "omdata.h"
 #include "options.h"
 #include "overmapbuffer.h"
@@ -132,9 +133,78 @@ constexpr size_t FAR_TERRAIN_CACHE_MAX_SUBMAPS = 32768;
 constexpr size_t FAR_SOURCE_WORK_PER_FRAME = 4;
 constexpr double FAR_SOURCE_TIME_BUDGET_MS = 2.0;
 
+// One height sample per map-square corner, plus a one-square margin for normals
+// and boundary queries. Heights are display-unit offsets from the view center.
+constexpr int TERRAIN_HEIGHT_MARGIN = 1;
+constexpr int TERRAIN_HEIGHT_SIZE = FAR_SUBMAP_RADIUS * 2 + 1 + TERRAIN_HEIGHT_MARGIN * 2;
+constexpr int TERRAIN_HEIGHT_ORIGIN = -FAR_SUBMAP_RADIUS - TERRAIN_HEIGHT_MARGIN;
+constexpr size_t TERRAIN_HEIGHT_SAMPLE_COUNT = static_cast<size_t>( TERRAIN_HEIGHT_SIZE ) *
+        TERRAIN_HEIGHT_SIZE;
+constexpr size_t TERRAIN_HEIGHT_BYTES = TERRAIN_HEIGHT_SAMPLE_COUNT * sizeof( float );
+constexpr int TERRAIN_GRID_MATERIAL_FLOATS = 12;
+constexpr size_t TERRAIN_GRID_MATERIAL_BYTES = TERRAIN_HEIGHT_SAMPLE_COUNT *
+        TERRAIN_GRID_MATERIAL_FLOATS * sizeof( float );
+constexpr int WATER_FLAG = 1 << 14;
+
+struct terrain_height_state {
+    bool enabled = false;
+    bool valid = false;
+    const WORLD *world = nullptr;
+    std::string dimension;
+    point_abs_ms center = point_abs_ms::zero;
+    point_abs_ms origin = point_abs_ms::zero;
+    int center_z = 0;
+    double reference_m = 0.0;
+    float min_z = 0.0f;
+    float max_z = 0.0f;
+    uint64_t serial = 0;
+    std::vector<float> samples;
+};
+terrain_height_state g_terrain_height;
+
+bool terrain_height_enabled()
+{
+    return g_terrain_height.enabled && g_terrain_height.valid;
+}
+
+struct terrain_grid_bucket {
+    SDL_Texture *atlas = nullptr;
+    std::vector<Uint32> indices;
+};
+struct terrain_grid_gather {
+    std::vector<float> materials;
+    std::vector<terrain_grid_bucket> buckets;
+    std::unordered_map<SDL_Texture *, size_t> bucket_index;
+    size_t bucket_count = 0;
+    int min_x = TERRAIN_HEIGHT_SIZE;
+    int min_y = TERRAIN_HEIGHT_SIZE;
+    int max_x = -1;
+    int max_y = -1;
+    uint64_t tiles = 0;
+
+    bool empty() const {
+        return tiles == 0;
+    }
+    void clear() {
+        materials.resize( TERRAIN_HEIGHT_SAMPLE_COUNT * TERRAIN_GRID_MATERIAL_FLOATS );
+        bucket_index.clear();
+        bucket_count = 0;
+        for( terrain_grid_bucket &bucket : buckets ) {
+            bucket.indices.clear();
+        }
+        min_x = TERRAIN_HEIGHT_SIZE;
+        min_y = TERRAIN_HEIGHT_SIZE;
+        max_x = -1;
+        max_y = -1;
+        tiles = 0;
+    }
+};
+terrain_grid_gather g_terrain_grid;
+
 using distant_lru_list = std::list<tripoint_abs_sm>;
 struct distant_terrain_snapshot {
     std::vector<ter_id> terrain;
+    std::vector<graded_surface> grades;
     ter_id uniform_terrain;
     std::pair<uint64_t, uint64_t> geometry_stamp;
     distant_lru_list::iterator lru_order;
@@ -144,9 +214,17 @@ struct distant_terrain_snapshot {
     ter_id terrain_at( const point_sm_ms &p ) const {
         return terrain.empty() ? uniform_terrain : terrain[p.y() * SEEX + p.x()];
     }
+    const graded_surface *grade_at( const point_sm_ms &p ) const {
+        if( grades.empty() ) {
+            return nullptr;
+        }
+        const graded_surface &grade = grades[p.y() * SEEX + p.x()];
+        return grade.centimetres == std::numeric_limits<int>::min() ? nullptr : &grade;
+    }
 };
-// float3 pos + float3 scale + float2 uv0 + float2 uv1 + float4 color + float flags + float pad + float4 emission
-constexpr int INSTANCE_STRIDE = 80;
+// float3 pos + float3 scale + float2 uv0 + float2 uv1 + float4 color + float flags + float pad
+// + float4 emission + float logical (undeformed) Z.
+constexpr int INSTANCE_STRIDE = 84;
 
 constexpr float LEVEL_HEIGHT = 2.6f;
 constexpr int SHADOW_MAP_SIZE = 2048;
@@ -428,15 +506,27 @@ constexpr float CULL_Z_ABOVE = 5.0f;
 bool bounds_in_frustum( const view_frustum &f, const float x0, const float y0,
                         const float x1, const float y1, const float wz )
 {
-    return aabb_in_frustum( f, { x0 - CULL_XY_MARGIN, y0 - CULL_XY_MARGIN, wz - CULL_Z_BELOW },
-    { x1 + CULL_XY_MARGIN, y1 + CULL_XY_MARGIN, wz + CULL_Z_ABOVE } );
+    float zmin = wz - CULL_Z_BELOW;
+    float zmax = wz + CULL_Z_ABOVE;
+    if( terrain_height_enabled() && g_terrain_height.center_z + std::lround( wz / LEVEL_HEIGHT ) >= 0 ) {
+        zmin += g_terrain_height.min_z;
+        zmax += g_terrain_height.max_z;
+    }
+    return aabb_in_frustum( f, { x0 - CULL_XY_MARGIN, y0 - CULL_XY_MARGIN, zmin },
+    { x1 + CULL_XY_MARGIN, y1 + CULL_XY_MARGIN, zmax } );
 }
 
 bool bounds_fully_in_frustum( const view_frustum &f, const float x0, const float y0,
                               const float x1, const float y1, const float wz )
 {
-    return aabb_fully_in_frustum( f, { x0 - CULL_XY_MARGIN, y0 - CULL_XY_MARGIN, wz - CULL_Z_BELOW },
-    { x1 + CULL_XY_MARGIN, y1 + CULL_XY_MARGIN, wz + CULL_Z_ABOVE } );
+    float zmin = wz - CULL_Z_BELOW;
+    float zmax = wz + CULL_Z_ABOVE;
+    if( terrain_height_enabled() && g_terrain_height.center_z + std::lround( wz / LEVEL_HEIGHT ) >= 0 ) {
+        zmin += g_terrain_height.min_z;
+        zmax += g_terrain_height.max_z;
+    }
+    return aabb_fully_in_frustum( f, { x0 - CULL_XY_MARGIN, y0 - CULL_XY_MARGIN, zmin },
+    { x1 + CULL_XY_MARGIN, y1 + CULL_XY_MARGIN, zmax } );
 }
 
 bool tile_in_frustum( const view_frustum &f, const point d, const float wz )
@@ -650,6 +740,15 @@ struct frame_slot {
     SDL_GPUTexture *light_tex = nullptr;
     SDL_Texture *color_tex_sdl = nullptr;
     SDL_GPUTransferBuffer *light_tb = nullptr;
+    SDL_GPUTexture *terrain_height_tex = nullptr;
+    SDL_GPUTransferBuffer *terrain_height_tb = nullptr;
+    uint64_t terrain_height_serial = 0;
+    SDL_GPUTexture *terrain_grid_material_tex = nullptr;
+    SDL_GPUTransferBuffer *terrain_grid_material_tb = nullptr;
+    SDL_GPUBuffer *terrain_grid_ib = nullptr;
+    size_t terrain_grid_ib_size = 0;
+    SDL_GPUTransferBuffer *terrain_grid_index_tb = nullptr;
+    size_t terrain_grid_index_tb_size = 0;
     SDL_GPUTexture *weather_mask_tex = nullptr;
     SDL_GPUTransferBuffer *weather_mask_tb = nullptr;
     int weather_mask_center_z = 0;
@@ -677,6 +776,10 @@ struct context {
     SDL_GPUGraphicsPipeline *pipeline_decal = nullptr;
     SDL_GPUGraphicsPipeline *pipeline_decal_mrt = nullptr;
     SDL_GPUGraphicsPipeline *shadow_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline *terrain_grid_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline *terrain_grid_pipeline_mrt = nullptr;
+    SDL_GPUGraphicsPipeline *terrain_grid_prepass_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline *terrain_grid_shadow_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *post_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *post_bloom_pipeline = nullptr;
     SDL_GPUGraphicsPipeline *bloom_extract_pipeline = nullptr;
@@ -747,6 +850,58 @@ point g_last_mouse = point::north_west;
 // game-driven cursors forwarded from cata_tiles (targeting, construction...);
 // cleared after each frame's gather
 std::vector<std::pair<tripoint_bub_ms, bool>> g_game_cursors;
+
+// Instance emission needs the undeformed level as well as the displaced world Z.
+// Gather sets this around each tile; NaN means the emitted Z is already logical.
+float g_emit_logical_z = std::numeric_limits<float>::quiet_NaN();
+
+float sample_terrain_height( const float x, const float y )
+{
+    if( !terrain_height_enabled() ) {
+        return 0.0f;
+    }
+    const float gx = x - TERRAIN_HEIGHT_ORIGIN;
+    const float gy = y - TERRAIN_HEIGHT_ORIGIN;
+    const int x0 = std::clamp( static_cast<int>( std::floor( gx ) ), 0, TERRAIN_HEIGHT_SIZE - 1 );
+    const int y0 = std::clamp( static_cast<int>( std::floor( gy ) ), 0, TERRAIN_HEIGHT_SIZE - 1 );
+    const int x1 = std::min( x0 + 1, TERRAIN_HEIGHT_SIZE - 1 );
+    const int y1 = std::min( y0 + 1, TERRAIN_HEIGHT_SIZE - 1 );
+    const float fx = std::clamp( gx - std::floor( gx ), 0.0f, 1.0f );
+    const float fy = std::clamp( gy - std::floor( gy ), 0.0f, 1.0f );
+    const auto at = [&]( const int sx, const int sy ) {
+        return g_terrain_height.samples[static_cast<size_t>( sy ) * TERRAIN_HEIGHT_SIZE + sx];
+    };
+    const float top = at( x0, y0 ) + ( at( x1, y0 ) - at( x0, y0 ) ) * fx;
+    const float bottom = at( x0, y1 ) + ( at( x1, y1 ) - at( x0, y1 ) ) * fx;
+    return top + ( bottom - top ) * fy;
+}
+
+float terrain_height_offset( const tripoint_abs_ms &position, const graded_surface *grade )
+{
+    if( !terrain_height_enabled() || position.z() < 0 ) {
+        return 0.0f;
+    }
+    const double altitude = grade ? grade->centimetres / 100.0 :
+                            north_america::surface_elevation( position.xy() );
+    constexpr double vertical_scale = LEVEL_HEIGHT / north_america::floor_height_m;
+    return static_cast<float>( ( altitude - g_terrain_height.reference_m ) * vertical_scale );
+}
+
+float terrain_height_offset( map &here, const tripoint_bub_ms &position )
+{
+    if( !terrain_height_enabled() || position.z() < 0 ) {
+        return 0.0f;
+    }
+    constexpr double vertical_scale = LEVEL_HEIGHT / north_america::floor_height_m;
+    const double ground = north_america::altitude_at( here, position ) -
+                          position.z() * north_america::floor_height_m;
+    return static_cast<float>( ( ground - g_terrain_height.reference_m ) * vertical_scale );
+}
+
+const graded_surface *terrain_grade_at( map &here, const tripoint_bub_ms &position )
+{
+    return terrain_height_enabled() && position.z() == 0 ? here.get_surface_grade( position ) : nullptr;
+}
 
 // The eight single-step compass directions, clockwise from north (map space:
 // +x east, +y south). Movement keys name directions in the screen frame, with
@@ -824,6 +979,12 @@ struct frame_profile {
     uint64_t far_instances = 0;
     uint64_t far_pending = 0;
     uint64_t far_cache_size = 0;
+    uint64_t height_rebuilds = 0;
+    uint64_t height_upload_bytes = 0;
+    uint64_t height_instances = 0;
+    uint64_t grid_indices = 0;
+    uint64_t grid_upload_bytes = 0;
+    double height_build_ms = 0.0;
     double far_source_ms = 0.0;
     double far_ms = 0.0;
     double memory_ms = 0.0;
@@ -856,6 +1017,12 @@ struct frame_profile {
         far_instances += other.far_instances;
         far_pending += other.far_pending;
         far_cache_size += other.far_cache_size;
+        height_rebuilds += other.height_rebuilds;
+        height_upload_bytes += other.height_upload_bytes;
+        height_instances += other.height_instances;
+        grid_indices += other.grid_indices;
+        grid_upload_bytes += other.grid_upload_bytes;
+        height_build_ms += other.height_build_ms;
         far_source_ms += other.far_source_ms;
         far_ms += other.far_ms;
         memory_ms += other.memory_ms;
@@ -919,10 +1086,264 @@ void publish_profile( const frame_profile &frame )
         << " far_instances=" << avg( total.far_instances )
         << " far_source=" << avg( total.far_source_ms )
         << "ms far_queue=" << avg( total.far_pending )
-        << " far_cache=" << avg( total.far_cache_size );
+        << " far_cache=" << avg( total.far_cache_size )
+        << " | height_build=" << avg( total.height_build_ms )
+        << "ms height_rebuilds=" << avg( total.height_rebuilds )
+        << " height_upload_KiB=" << avg( total.height_upload_bytes ) / 1024.0
+        << " height_instances=" << avg( total.height_instances )
+        << " grid_indices=" << avg( total.grid_indices )
+        << " grid_upload_KiB=" << avg( total.grid_upload_bytes ) / 1024.0;
     write_status( out.str() );
     total = frame_profile{};
     frames = 0;
+}
+
+void prepare_terrain_height( map &here, const tripoint_bub_ms &center )
+{
+    const tripoint_abs_ms center_abs = here.get_abs( center );
+    const WORLD *world = world_generator ? world_generator->active_world : nullptr;
+    const std::string dimension = g ? g->get_dimension_prefix().str() : std::string();
+    const bool requested = get_option<bool>( "RENDER3D_TERRAIN_HEIGHT" ) &&
+                           north_america::elevation_active();
+    g_terrain_height.center_z = center.z();
+    if( requested == g_terrain_height.enabled && world == g_terrain_height.world &&
+        dimension == g_terrain_height.dimension && center_abs.xy() == g_terrain_height.center &&
+        ( !requested || g_terrain_height.valid ) ) {
+        return;
+    }
+
+    const bool profile = profiling_enabled();
+    const Uint64 begin = profile_ticks( profile );
+    g_terrain_height.enabled = requested;
+    g_terrain_height.valid = false;
+    g_terrain_height.world = world;
+    g_terrain_height.dimension = dimension;
+    g_terrain_height.center = center_abs.xy();
+    g_terrain_height.center_z = center.z();
+    ++g_terrain_height.serial;
+    ++g_profile.height_rebuilds;
+    if( !requested ) {
+        g_terrain_height.samples.clear();
+        g_terrain_height.min_z = 0.0f;
+        g_terrain_height.max_z = 0.0f;
+        g_profile.height_build_ms = profile_ms( begin, profile_ticks( true ) );
+        return;
+    }
+
+    constexpr double vertical_scale = LEVEL_HEIGHT / north_america::floor_height_m;
+    g_terrain_height.reference_m = north_america::surface_elevation( center_abs.xy() );
+    g_terrain_height.origin = center_abs.xy() + point( TERRAIN_HEIGHT_ORIGIN, TERRAIN_HEIGHT_ORIGIN );
+    g_terrain_height.samples.resize( TERRAIN_HEIGHT_SAMPLE_COUNT );
+    g_terrain_height.min_z = std::numeric_limits<float>::max();
+    g_terrain_height.max_z = std::numeric_limits<float>::lowest();
+
+    const point_abs_ms last = g_terrain_height.origin + point( TERRAIN_HEIGHT_SIZE - 1,
+                              TERRAIN_HEIGHT_SIZE - 1 );
+    const point_abs_omt first_omt = project_to<coords::omt>( g_terrain_height.origin );
+    const point_abs_omt last_omt = project_to<coords::omt>( last );
+    constexpr int span_x = SEEX * 2;
+    constexpr int span_y = SEEY * 2;
+    for( int omt_y = first_omt.y(); omt_y <= last_omt.y(); ++omt_y ) {
+        for( int omt_x = first_omt.x(); omt_x <= last_omt.x(); ++omt_x ) {
+            const point_abs_ms start = project_to<coords::ms>( point_abs_omt( omt_x, omt_y ) );
+            const double h00 = north_america::surface_elevation( start );
+            const double h10 = north_america::surface_elevation( start + point( span_x, 0 ) );
+            const double h01 = north_america::surface_elevation( start + point( 0, span_y ) );
+            const double h11 = north_america::surface_elevation( start + point( span_x, span_y ) );
+            for( int y = 0; y <= span_y; ++y ) {
+                const double fy = static_cast<double>( y ) / span_y;
+                for( int x = 0; x <= span_x; ++x ) {
+                    const point relative = start.raw() + point( x, y ) - g_terrain_height.origin.raw();
+                    if( relative.x < 0 || relative.y < 0 || relative.x >= TERRAIN_HEIGHT_SIZE ||
+                        relative.y >= TERRAIN_HEIGHT_SIZE ) {
+                        continue;
+                    }
+                    const double fx = static_cast<double>( x ) / span_x;
+                    const double top = h00 + ( h10 - h00 ) * fx;
+                    const double bottom = h01 + ( h11 - h01 ) * fx;
+                    const double metres = top + ( bottom - top ) * fy;
+                    const float height = static_cast<float>( ( metres - g_terrain_height.reference_m ) *
+                                         vertical_scale );
+                    g_terrain_height.samples[static_cast<size_t>( relative.y ) * TERRAIN_HEIGHT_SIZE +
+                                             relative.x] = height;
+                    g_terrain_height.min_z = std::min( g_terrain_height.min_z, height );
+                    g_terrain_height.max_z = std::max( g_terrain_height.max_z, height );
+                }
+            }
+        }
+    }
+    g_terrain_height.valid = true;
+    g_profile.height_build_ms = profile_ms( begin, profile_ticks( true ) );
+}
+
+bool upload_terrain_height( SDL_GPUCommandBuffer *cmd, frame_slot &slot )
+{
+    if( !terrain_height_enabled() ) {
+        return true;
+    }
+    if( !slot.terrain_height_tex || !slot.terrain_height_tb ) {
+        return false;
+    }
+    if( slot.terrain_height_serial == g_terrain_height.serial ) {
+        return true;
+    }
+    void *mapped = SDL_MapGPUTransferBuffer( g_ctx.device, slot.terrain_height_tb, false );
+    if( !mapped ) {
+        return false;
+    }
+    std::memcpy( mapped, g_terrain_height.samples.data(), TERRAIN_HEIGHT_BYTES );
+    SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass( cmd );
+    if( !copy ) {
+        SDL_UnmapGPUTransferBuffer( g_ctx.device, slot.terrain_height_tb );
+        return false;
+    }
+    SDL_GPUTextureTransferInfo src{};
+    src.transfer_buffer = slot.terrain_height_tb;
+    src.pixels_per_row = TERRAIN_HEIGHT_SIZE;
+    src.rows_per_layer = TERRAIN_HEIGHT_SIZE;
+    SDL_GPUTextureRegion dst{};
+    dst.texture = slot.terrain_height_tex;
+    dst.w = TERRAIN_HEIGHT_SIZE;
+    dst.h = TERRAIN_HEIGHT_SIZE;
+    dst.d = 1;
+    SDL_UploadToGPUTexture( copy, &src, &dst, false );
+    SDL_EndGPUCopyPass( copy );
+    SDL_UnmapGPUTransferBuffer( g_ctx.device, slot.terrain_height_tb );
+    slot.terrain_height_serial = g_terrain_height.serial;
+    g_profile.height_upload_bytes += TERRAIN_HEIGHT_BYTES;
+    return true;
+}
+
+void bind_terrain_height_vertex( SDL_GPURenderPass *pass, frame_slot &slot )
+{
+    SDL_GPUTextureSamplerBinding binding{};
+    binding.texture = slot.terrain_height_tex ? slot.terrain_height_tex : g_ctx.fallback_tex;
+    binding.sampler = g_ctx.sampler;
+    SDL_BindGPUVertexSamplers( pass, 0, &binding, 1 );
+}
+
+bool upload_terrain_grid( SDL_GPUCommandBuffer *cmd, frame_slot &slot,
+                          const std::vector<Uint32> &indices )
+{
+    if( g_terrain_grid.empty() ) {
+        return true;
+    }
+    if( indices.empty() ) {
+        return false;
+    }
+    if( !slot.terrain_grid_material_tex ) {
+        SDL_GPUTextureCreateInfo ci{};
+        ci.type = SDL_GPU_TEXTURETYPE_2D;
+        ci.format = SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT;
+        ci.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        ci.width = TERRAIN_HEIGHT_SIZE * 3;
+        ci.height = TERRAIN_HEIGHT_SIZE;
+        ci.layer_count_or_depth = 1;
+        ci.num_levels = 1;
+        ci.sample_count = SDL_GPU_SAMPLECOUNT_1;
+        slot.terrain_grid_material_tex = SDL_CreateGPUTexture( g_ctx.device, &ci );
+    }
+    if( !slot.terrain_grid_material_tb ) {
+        SDL_GPUTransferBufferCreateInfo ti{};
+        ti.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+        ti.size = TERRAIN_GRID_MATERIAL_BYTES;
+        slot.terrain_grid_material_tb = SDL_CreateGPUTransferBuffer( g_ctx.device, &ti );
+    }
+    const size_t index_bytes = indices.size() * sizeof( Uint32 );
+    if( index_bytes > slot.terrain_grid_ib_size ) {
+        if( slot.terrain_grid_ib ) {
+            SDL_ReleaseGPUBuffer( g_ctx.device, slot.terrain_grid_ib );
+            slot.terrain_grid_ib = nullptr;
+            slot.terrain_grid_ib_size = 0;
+        }
+        size_t new_size = 64 * 1024;
+        while( new_size < index_bytes ) {
+            new_size *= 2;
+        }
+        SDL_GPUBufferCreateInfo bi{};
+        bi.usage = SDL_GPU_BUFFERUSAGE_INDEX;
+        bi.size = static_cast<Uint32>( new_size );
+        slot.terrain_grid_ib = SDL_CreateGPUBuffer( g_ctx.device, &bi );
+        slot.terrain_grid_ib_size = slot.terrain_grid_ib ? new_size : 0;
+    }
+    if( index_bytes > slot.terrain_grid_index_tb_size ) {
+        if( slot.terrain_grid_index_tb ) {
+            SDL_ReleaseGPUTransferBuffer( g_ctx.device, slot.terrain_grid_index_tb );
+            slot.terrain_grid_index_tb = nullptr;
+            slot.terrain_grid_index_tb_size = 0;
+        }
+        size_t new_size = 64 * 1024;
+        while( new_size < index_bytes ) {
+            new_size *= 2;
+        }
+        SDL_GPUTransferBufferCreateInfo ti{};
+        ti.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+        ti.size = static_cast<Uint32>( new_size );
+        slot.terrain_grid_index_tb = SDL_CreateGPUTransferBuffer( g_ctx.device, &ti );
+        slot.terrain_grid_index_tb_size = slot.terrain_grid_index_tb ? new_size : 0;
+    }
+    if( !slot.terrain_grid_material_tex || !slot.terrain_grid_material_tb ||
+        !slot.terrain_grid_ib || !slot.terrain_grid_index_tb ) {
+        return false;
+    }
+
+    auto *material = static_cast<char *>( SDL_MapGPUTransferBuffer( g_ctx.device,
+                                         slot.terrain_grid_material_tb, false ) );
+    auto *index_data = static_cast<char *>( SDL_MapGPUTransferBuffer( g_ctx.device,
+                                            slot.terrain_grid_index_tb, false ) );
+    if( !material || !index_data ) {
+        if( material ) {
+            SDL_UnmapGPUTransferBuffer( g_ctx.device, slot.terrain_grid_material_tb );
+        }
+        if( index_data ) {
+            SDL_UnmapGPUTransferBuffer( g_ctx.device, slot.terrain_grid_index_tb );
+        }
+        return false;
+    }
+    const int width = g_terrain_grid.max_x - g_terrain_grid.min_x + 1;
+    const int height = g_terrain_grid.max_y - g_terrain_grid.min_y + 1;
+    for( int y = 0; y < height; ++y ) {
+        const size_t floats = ( static_cast<size_t>( g_terrain_grid.min_y + y ) * TERRAIN_HEIGHT_SIZE +
+                                g_terrain_grid.min_x ) * TERRAIN_GRID_MATERIAL_FLOATS;
+        const size_t bytes = static_cast<size_t>( width ) * TERRAIN_GRID_MATERIAL_FLOATS * sizeof( float );
+        std::memcpy( material + floats * sizeof( float ), g_terrain_grid.materials.data() + floats, bytes );
+    }
+    std::memcpy( index_data, indices.data(), index_bytes );
+
+    SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass( cmd );
+    if( !copy ) {
+        SDL_UnmapGPUTransferBuffer( g_ctx.device, slot.terrain_grid_material_tb );
+        SDL_UnmapGPUTransferBuffer( g_ctx.device, slot.terrain_grid_index_tb );
+        return false;
+    }
+    const size_t material_offset = ( static_cast<size_t>( g_terrain_grid.min_y ) * TERRAIN_HEIGHT_SIZE +
+                                     g_terrain_grid.min_x ) * TERRAIN_GRID_MATERIAL_FLOATS * sizeof( float );
+    SDL_GPUTextureTransferInfo material_src{};
+    material_src.transfer_buffer = slot.terrain_grid_material_tb;
+    material_src.offset = static_cast<Uint32>( material_offset );
+    material_src.pixels_per_row = TERRAIN_HEIGHT_SIZE * 3;
+    material_src.rows_per_layer = TERRAIN_HEIGHT_SIZE;
+    SDL_GPUTextureRegion material_dst{};
+    material_dst.texture = slot.terrain_grid_material_tex;
+    material_dst.x = g_terrain_grid.min_x * 3;
+    material_dst.y = g_terrain_grid.min_y;
+    material_dst.w = width * 3;
+    material_dst.h = height;
+    material_dst.d = 1;
+    SDL_UploadToGPUTexture( copy, &material_src, &material_dst, false );
+
+    SDL_GPUTransferBufferLocation index_src{};
+    index_src.transfer_buffer = slot.terrain_grid_index_tb;
+    SDL_GPUBufferRegion index_dst{};
+    index_dst.buffer = slot.terrain_grid_ib;
+    index_dst.size = static_cast<Uint32>( index_bytes );
+    SDL_UploadToGPUBuffer( copy, &index_src, &index_dst, false );
+    SDL_EndGPUCopyPass( copy );
+    SDL_UnmapGPUTransferBuffer( g_ctx.device, slot.terrain_grid_material_tb );
+    SDL_UnmapGPUTransferBuffer( g_ctx.device, slot.terrain_grid_index_tb );
+    g_profile.grid_upload_bytes += index_bytes +
+                                   static_cast<size_t>( width ) * height * TERRAIN_GRID_MATERIAL_FLOATS * sizeof( float );
+    return true;
 }
 
 void reset_frame_tracking()
@@ -1110,6 +1531,33 @@ void context::teardown()
                 SDL_ReleaseGPUTransferBuffer( device, slot.light_tb );
                 slot.light_tb = nullptr;
             }
+            if( slot.terrain_height_tex ) {
+                SDL_ReleaseGPUTexture( device, slot.terrain_height_tex );
+                slot.terrain_height_tex = nullptr;
+            }
+            if( slot.terrain_height_tb ) {
+                SDL_ReleaseGPUTransferBuffer( device, slot.terrain_height_tb );
+                slot.terrain_height_tb = nullptr;
+            }
+            slot.terrain_height_serial = 0;
+            if( slot.terrain_grid_material_tex ) {
+                SDL_ReleaseGPUTexture( device, slot.terrain_grid_material_tex );
+                slot.terrain_grid_material_tex = nullptr;
+            }
+            if( slot.terrain_grid_material_tb ) {
+                SDL_ReleaseGPUTransferBuffer( device, slot.terrain_grid_material_tb );
+                slot.terrain_grid_material_tb = nullptr;
+            }
+            if( slot.terrain_grid_ib ) {
+                SDL_ReleaseGPUBuffer( device, slot.terrain_grid_ib );
+                slot.terrain_grid_ib = nullptr;
+                slot.terrain_grid_ib_size = 0;
+            }
+            if( slot.terrain_grid_index_tb ) {
+                SDL_ReleaseGPUTransferBuffer( device, slot.terrain_grid_index_tb );
+                slot.terrain_grid_index_tb = nullptr;
+                slot.terrain_grid_index_tb_size = 0;
+            }
             if( slot.weather_mask_tex ) {
                 SDL_ReleaseGPUTexture( device, slot.weather_mask_tex );
                 slot.weather_mask_tex = nullptr;
@@ -1191,6 +1639,22 @@ void context::teardown()
             SDL_ReleaseGPUGraphicsPipeline( device, shadow_pipeline );
             shadow_pipeline = nullptr;
         }
+        if( terrain_grid_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, terrain_grid_pipeline );
+            terrain_grid_pipeline = nullptr;
+        }
+        if( terrain_grid_pipeline_mrt ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, terrain_grid_pipeline_mrt );
+            terrain_grid_pipeline_mrt = nullptr;
+        }
+        if( terrain_grid_prepass_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, terrain_grid_prepass_pipeline );
+            terrain_grid_prepass_pipeline = nullptr;
+        }
+        if( terrain_grid_shadow_pipeline ) {
+            SDL_ReleaseGPUGraphicsPipeline( device, terrain_grid_shadow_pipeline );
+            terrain_grid_shadow_pipeline = nullptr;
+        }
         if( post_pipeline ) {
             SDL_ReleaseGPUGraphicsPipeline( device, post_pipeline );
             post_pipeline = nullptr;
@@ -1260,7 +1724,8 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
     bool ready = g_ctx.tex_w == w && g_ctx.tex_h == h;
     if( ready ) {
         for( const frame_slot &slot : g_ctx.slots ) {
-            ready = ready && slot.color_tex && slot.hdr_tex && slot.depth_tex && slot.color_tex_sdl;
+            ready = ready && slot.color_tex && slot.hdr_tex && slot.depth_tex && slot.color_tex_sdl &&
+                    slot.terrain_height_tex && slot.terrain_height_tb;
         }
     }
     if( ready ) {
@@ -1332,6 +1797,33 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
         if( slot.light_tb ) {
             SDL_ReleaseGPUTransferBuffer( g_ctx.device, slot.light_tb );
             slot.light_tb = nullptr;
+        }
+        if( slot.terrain_height_tex ) {
+            SDL_ReleaseGPUTexture( g_ctx.device, slot.terrain_height_tex );
+            slot.terrain_height_tex = nullptr;
+        }
+        if( slot.terrain_height_tb ) {
+            SDL_ReleaseGPUTransferBuffer( g_ctx.device, slot.terrain_height_tb );
+            slot.terrain_height_tb = nullptr;
+        }
+        slot.terrain_height_serial = 0;
+        if( slot.terrain_grid_material_tex ) {
+            SDL_ReleaseGPUTexture( g_ctx.device, slot.terrain_grid_material_tex );
+            slot.terrain_grid_material_tex = nullptr;
+        }
+        if( slot.terrain_grid_material_tb ) {
+            SDL_ReleaseGPUTransferBuffer( g_ctx.device, slot.terrain_grid_material_tb );
+            slot.terrain_grid_material_tb = nullptr;
+        }
+        if( slot.terrain_grid_ib ) {
+            SDL_ReleaseGPUBuffer( g_ctx.device, slot.terrain_grid_ib );
+            slot.terrain_grid_ib = nullptr;
+            slot.terrain_grid_ib_size = 0;
+        }
+        if( slot.terrain_grid_index_tb ) {
+            SDL_ReleaseGPUTransferBuffer( g_ctx.device, slot.terrain_grid_index_tb );
+            slot.terrain_grid_index_tb = nullptr;
+            slot.terrain_grid_index_tb_size = 0;
         }
         if( slot.weather_mask_tex ) {
             SDL_ReleaseGPUTexture( g_ctx.device, slot.weather_mask_tex );
@@ -1406,6 +1898,19 @@ bool ensure_targets( SDL_Renderer *renderer, const int w, const int h )
         slot.light_tb = SDL_CreateGPUTransferBuffer( g_ctx.device, &light_ti );
         if( !slot.light_tex || !slot.light_tb ) {
             write_status( "colored-light texture unavailable; using white light hue" );
+        }
+        ci.format = SDL_GPU_TEXTUREFORMAT_R32_FLOAT;
+        ci.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        ci.width = TERRAIN_HEIGHT_SIZE;
+        ci.height = TERRAIN_HEIGHT_SIZE;
+        slot.terrain_height_tex = SDL_CreateGPUTexture( g_ctx.device, &ci );
+        SDL_GPUTransferBufferCreateInfo terrain_height_ti{};
+        terrain_height_ti.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+        terrain_height_ti.size = TERRAIN_HEIGHT_BYTES;
+        slot.terrain_height_tb = SDL_CreateGPUTransferBuffer( g_ctx.device, &terrain_height_ti );
+        slot.terrain_height_serial = 0;
+        if( !slot.terrain_height_tex || !slot.terrain_height_tb ) {
+            write_status( "terrain-height texture unavailable; heightfield disabled" );
         }
         slot.light_generations.fill( std::numeric_limits<uint64_t>::max() );
         slot.light_tint = true;
@@ -1750,8 +2255,8 @@ bool probe( SDL_Renderer *renderer )
     }
     g_ctx.device = device;
 
-    SDL_GPUShader *vs = load_shader( device, "terrain3d.vert", SDL_GPU_SHADERSTAGE_VERTEX, 1 );
-    SDL_GPUShader *fs = load_shader( device, "terrain3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 5 );
+    SDL_GPUShader *vs = load_shader( device, "terrain3d.vert", SDL_GPU_SHADERSTAGE_VERTEX, 1, 1 );
+    SDL_GPUShader *fs = load_shader( device, "terrain3d.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 6 );
     if( !vs || !fs ) {
         if( vs ) {
             SDL_ReleaseGPUShader( device, vs );
@@ -1772,7 +2277,7 @@ bool probe( SDL_Renderer *renderer )
     vb_descs[1].pitch = INSTANCE_STRIDE;
     vb_descs[1].input_rate = SDL_GPU_VERTEXINPUTRATE_INSTANCE;
 
-    SDL_GPUVertexAttribute attrs[10] {};
+    SDL_GPUVertexAttribute attrs[11] {};
     attrs[0].location = 0;
     attrs[0].buffer_slot = 0;
     attrs[0].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3;
@@ -1813,6 +2318,10 @@ bool probe( SDL_Renderer *renderer )
     attrs[9].buffer_slot = 1;
     attrs[9].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4;
     attrs[9].offset = 16 * sizeof( float );
+    attrs[10].location = 10;
+    attrs[10].buffer_slot = 1;
+    attrs[10].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT;
+    attrs[10].offset = 20 * sizeof( float );
 
     SDL_GPUGraphicsPipelineCreateInfo pi{};
     pi.vertex_shader = vs;
@@ -1820,7 +2329,7 @@ bool probe( SDL_Renderer *renderer )
     pi.vertex_input_state.vertex_buffer_descriptions = vb_descs;
     pi.vertex_input_state.num_vertex_buffers = 2;
     pi.vertex_input_state.vertex_attributes = attrs;
-    pi.vertex_input_state.num_vertex_attributes = 10;
+    pi.vertex_input_state.num_vertex_attributes = 11;
     pi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
     pi.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
     // P0: no culling so a winding/y-flip mismatch can never blank the scene
@@ -1872,10 +2381,54 @@ bool probe( SDL_Renderer *renderer )
     if( !g_ctx.prepass_pipeline ) {
         write_status( "depth prepass unavailable; GTAO disabled" );
     }
+
+    SDL_GPUShader *grid_vs = load_shader( device, "terrain_grid.vert", SDL_GPU_SHADERSTAGE_VERTEX, 1, 1 );
+    SDL_GPUShader *grid_shadow_vs = load_shader( device, "terrain_grid_shadow.vert",
+                                      SDL_GPU_SHADERSTAGE_VERTEX, 1, 1 );
+    SDL_GPUShader *grid_shadow_fs = load_shader( device, "terrain_grid_shadow.frag",
+                                      SDL_GPU_SHADERSTAGE_FRAGMENT, 0 );
+    if( grid_vs ) {
+        SDL_GPUGraphicsPipelineCreateInfo grid_pi = pi;
+        grid_pi.vertex_shader = grid_vs;
+        grid_pi.fragment_shader = fs;
+        grid_pi.vertex_input_state = SDL_GPUVertexInputState{};
+        grid_pi.depth_stencil_state.enable_depth_write = true;
+        grid_pi.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
+        grid_pi.target_info.num_color_targets = 1;
+        grid_pi.target_info.color_target_descriptions = &color_desc;
+        g_ctx.terrain_grid_pipeline = SDL_CreateGPUGraphicsPipeline( device, &grid_pi );
+        grid_pi.target_info.num_color_targets = 2;
+        grid_pi.target_info.color_target_descriptions = mrt_colors.data();
+        g_ctx.terrain_grid_pipeline_mrt = SDL_CreateGPUGraphicsPipeline( device, &grid_pi );
+        grid_pi.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_LESS;
+        grid_pi.target_info.num_color_targets = 0;
+        grid_pi.target_info.color_target_descriptions = nullptr;
+        g_ctx.terrain_grid_prepass_pipeline = SDL_CreateGPUGraphicsPipeline( device, &grid_pi );
+        if( grid_shadow_vs && grid_shadow_fs ) {
+            grid_pi.vertex_shader = grid_shadow_vs;
+            grid_pi.fragment_shader = grid_shadow_fs;
+            g_ctx.terrain_grid_shadow_pipeline = SDL_CreateGPUGraphicsPipeline( device, &grid_pi );
+        }
+        if( !g_ctx.terrain_grid_pipeline || !g_ctx.terrain_grid_pipeline_mrt ||
+            !g_ctx.terrain_grid_prepass_pipeline || !g_ctx.terrain_grid_shadow_pipeline ) {
+            write_status( "terrain grid pipelines unavailable; heightfield grid disabled" );
+        }
+    } else {
+        write_status( "terrain grid shaders missing; heightfield grid disabled" );
+    }
+    if( grid_vs ) {
+        SDL_ReleaseGPUShader( device, grid_vs );
+    }
+    if( grid_shadow_vs ) {
+        SDL_ReleaseGPUShader( device, grid_shadow_vs );
+    }
+    if( grid_shadow_fs ) {
+        SDL_ReleaseGPUShader( device, grid_shadow_fs );
+    }
     SDL_ReleaseGPUShader( device, vs );
     SDL_ReleaseGPUShader( device, fs );
 
-    SDL_GPUShader *shadow_vs = load_shader( device, "terrain3d_shadow.vert", SDL_GPU_SHADERSTAGE_VERTEX, 1 );
+    SDL_GPUShader *shadow_vs = load_shader( device, "terrain3d_shadow.vert", SDL_GPU_SHADERSTAGE_VERTEX, 1, 1 );
     SDL_GPUShader *shadow_fs = load_shader( device, "terrain3d_shadow.frag",
                                             SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 1 );
     if( shadow_vs && shadow_fs ) {
@@ -1965,7 +2518,7 @@ bool probe( SDL_Renderer *renderer )
     SDL_GPUShader *bounce_blur_fs = load_shader( device, "bounce3d_blur.frag",
                                     SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
     SDL_GPUShader *bounce_apply_fs = load_shader( device, "bounce3d_apply.frag",
-                                    SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 4 );
+                                    SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 5 );
     SDL_GPUShader *post_bloom_fs = load_shader( device, "tonemap3d_bloom.frag",
                                    SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 6 );
     SDL_GPUShader *water_fs = load_shader( device, "water3d.frag",
@@ -1973,7 +2526,7 @@ bool probe( SDL_Renderer *renderer )
     SDL_GPUShader *precipitation_vs = load_shader( device, "precipitation3d.vert",
                                       SDL_GPU_SHADERSTAGE_VERTEX, 1 );
     SDL_GPUShader *precipitation_fs = load_shader( device, "precipitation3d.frag",
-                                      SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1 );
+                                      SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 2 );
     SDL_GPUGraphicsPipelineCreateInfo ppi{};
     ppi.vertex_shader = post_vs;
     ppi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
@@ -2839,6 +3392,67 @@ bool lookup_sprite( cata_tiles *tiles, const std::string &id, const TILE_CATEGOR
 }
 
 // instances grouped by (geometry mode, atlas texture) -> one draw call each
+// Shared-grid ground keeps positions in the height texture and materials here.
+std::vector<Uint32> &terrain_grid_bucket_for( SDL_Texture *atlas )
+{
+    const auto found = g_terrain_grid.bucket_index.find( atlas );
+    if( found != g_terrain_grid.bucket_index.end() ) {
+        return g_terrain_grid.buckets[found->second].indices;
+    }
+    const size_t index = g_terrain_grid.bucket_count++;
+    g_terrain_grid.bucket_index.emplace( atlas, index );
+    if( index == g_terrain_grid.buckets.size() ) {
+        g_terrain_grid.buckets.push_back( terrain_grid_bucket{ atlas, {} } );
+    } else {
+        g_terrain_grid.buckets[index].atlas = atlas;
+    }
+    return g_terrain_grid.buckets[index].indices;
+}
+
+void push_grid_ground( const int dx, const int dy, const sprite_info &spr,
+                       const float r, const float g, const float b, const int rota4 = 0,
+                       const bool ghost = false, const float saturation = 1.0f,
+                       const bool memory = false, const bool lod = false,
+                       const std::array<float, 4> &emission = {}, const bool water = false )
+{
+    const int x = dx - TERRAIN_HEIGHT_ORIGIN;
+    const int y = dy - TERRAIN_HEIGHT_ORIGIN;
+    if( x < 0 || y < 0 || x + 1 >= TERRAIN_HEIGHT_SIZE || y + 1 >= TERRAIN_HEIGHT_SIZE ) {
+        return;
+    }
+    const size_t material = ( static_cast<size_t>( y ) * TERRAIN_HEIGHT_SIZE + x ) *
+                            TERRAIN_GRID_MATERIAL_FLOATS;
+    float *out = g_terrain_grid.materials.data() + material;
+    out[0] = spr.u0;
+    out[1] = spr.v0;
+    out[2] = spr.u1;
+    out[3] = spr.v1;
+    out[4] = r;
+    out[5] = g;
+    out[6] = b;
+    out[7] = saturation;
+    out[8] = ( spr.atlas ? 1.0f : 0.0f ) + 2.0f + static_cast<float>( ( rota4 & 3 ) << 2 ) +
+             ( ghost ? 32.0f : 0.0f ) + ( memory ? 64.0f : 0.0f ) + ( lod ? 512.0f : 0.0f ) +
+             ( water ? WATER_FLAG : 0 );
+    out[9] = emission[0];
+    out[10] = emission[1];
+    out[11] = emission[2];
+
+    const Uint32 v00 = static_cast<Uint32>( y * TERRAIN_HEIGHT_SIZE + x );
+    const Uint32 v10 = v00 + 1;
+    const Uint32 v01 = v00 + TERRAIN_HEIGHT_SIZE;
+    const Uint32 v11 = v01 + 1;
+    std::vector<Uint32> &indices = terrain_grid_bucket_for( spr.atlas );
+    indices.insert( indices.end(), { v00, v10, v11, v00, v11, v01 } );
+    g_terrain_grid.min_x = std::min( g_terrain_grid.min_x, x );
+    g_terrain_grid.min_y = std::min( g_terrain_grid.min_y, y );
+    g_terrain_grid.max_x = std::max( g_terrain_grid.max_x, x );
+    g_terrain_grid.max_y = std::max( g_terrain_grid.max_y, y );
+    ++g_terrain_grid.tiles;
+    ++g_profile.height_instances;
+}
+
+// instances grouped by (geometry mode, atlas texture) -> one draw call each
 struct instance_bucket {
     int mode = MODE_BOX;
     SDL_Texture *atlas = nullptr; // null -> untextured (hash color)
@@ -2895,10 +3509,10 @@ struct instance_sink {
 constexpr int CREATURE_HOSTILE_FLAG = 1 << 11;
 constexpr int CREATURE_NEUTRAL_FLAG = 1 << 12;
 constexpr int CREATURE_FRIENDLY_FLAG = 1 << 13;
-constexpr int WATER_FLAG = 1 << 14;
 constexpr int SHADOW_ONLY_FLAG = 1 << 15;
 constexpr int SUN_TRANSPARENT_FLAG = 1 << 16;
 constexpr int SUN_PORTAL_FLAG = 1 << 17;
+constexpr int TERRAIN_HEIGHT_FLAG = 1 << 18;
 
 std::array<float, 4> emission_from_light( const float emitted,
         const light_color_rgb &light_color = {} )
@@ -2973,6 +3587,16 @@ void push_instance( instance_sink out, const float dx, const float dy,
     out.data[17] = emission[1];
     out.data[18] = emission[2];
     out.data[19] = emission[3];
+    out.data[20] = std::isnan( g_emit_logical_z ) ? z : g_emit_logical_z;
+}
+
+void mark_terrain_height( std::vector<float> &out )
+{
+    constexpr size_t stride = INSTANCE_STRIDE / sizeof( float );
+    if( out.size() >= stride ) {
+        out[out.size() - stride + 14] += static_cast<float>( TERRAIN_HEIGHT_FLAG );
+        ++g_profile.height_instances;
+    }
 }
 
 void mark_same_level_wall( std::vector<float> &out, const bool current_level )
@@ -3221,6 +3845,58 @@ std::optional<tripoint_bub_ms> tile_at_pixel( const point &logical_pixel )
         return std::nullopt;
     }
     const float t = -g_eye.z / ray.z;
+    if( terrain_height_enabled() && g_center.z() == 0 ) {
+        const auto difference = [&]( const float distance ) {
+            const float x = g_eye.x + ray.x * distance;
+            const float y = g_eye.y + ray.y * distance;
+            return g_eye.z + ray.z * distance - sample_terrain_height( x, y );
+        };
+        if( difference( 0.0f ) < 0.0f ) {
+            return std::nullopt;
+        }
+        const float far_t = std::max( 64.0f, t + 64.0f + 2.0f *
+                                      std::max( std::abs( g_terrain_height.min_z ), std::abs( g_terrain_height.max_z ) ) );
+        float previous_t = 0.0f;
+        float previous_d = difference( previous_t );
+        float low = 0.0f;
+        float high = 0.0f;
+        bool bracketed = false;
+        constexpr int steps = 96;
+        for( int i = 1; i <= steps; ++i ) {
+            const float current_t = far_t * i / steps;
+            const float current_d = difference( current_t );
+            if( previous_d >= 0.0f && current_d <= 0.0f ) {
+                low = previous_t;
+                high = current_t;
+                bracketed = true;
+                break;
+            }
+            previous_t = current_t;
+            previous_d = current_d;
+        }
+        if( !bracketed ) {
+            return std::nullopt;
+        }
+        for( int i = 0; i < 12; ++i ) {
+            const float middle = ( low + high ) * 0.5f;
+            if( difference( middle ) > 0.0f ) {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        const float hit = ( low + high ) * 0.5f;
+        const float wx = g_eye.x + ray.x * hit;
+        const float wy = g_eye.y + ray.y * hit;
+        const float gx = wx - TERRAIN_HEIGHT_ORIGIN;
+        const float gy = wy - TERRAIN_HEIGHT_ORIGIN;
+        if( gx < 0.0f || gy < 0.0f || gx > TERRAIN_HEIGHT_SIZE - 1 ||
+            gy > TERRAIN_HEIGHT_SIZE - 1 ) {
+            return std::nullopt;
+        }
+        return g_center + tripoint( static_cast<int>( std::floor( wx ) ),
+                                    static_cast<int>( std::floor( wy ) ), 0 );
+    }
     const float wx = g_eye.x + ray.x * t;
     const float wy = g_eye.y + ray.y * t;
     return g_center + tripoint( static_cast<int>( std::floor( wx ) ),
@@ -3468,6 +4144,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                       const view_frustum &frustum, const view_frustum *caster_frustum )
 {
     map &here = get_map();
+    g_terrain_grid.clear();
+    g_emit_logical_z = std::numeric_limits<float>::quiet_NaN();
     bucket_count = 0;
     decals.clear();
     panels.clear();
@@ -3585,6 +4263,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
         bool is_tree = false;
         bool is_shrub = false;
         bool is_wall = false;
+        bool is_water = false;
         bool sun_transparent = false;
         bool sun_portal = false;
     };
@@ -3607,6 +4286,10 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
         traits.draw_floor = !traits.no_floor && !skip_untextured_terrain_surface( t );
         traits.is_tree = t.has_flag( "TREE" );
         traits.is_shrub = t.has_flag( "SHRUB" );
+        traits.is_water = t.has_flag( ter_furn_flag::TFLAG_SWIMMABLE ) ||
+                          t.has_flag( ter_furn_flag::TFLAG_DEEP_WATER ) ||
+                          t.has_flag( ter_furn_flag::TFLAG_SHALLOW_WATER ) ||
+                          t.has_flag( ter_furn_flag::TFLAG_NO_FLOOR_WATER );
         const bool is_panel = door_or_window( t ) || wall_opening( t );
         const bool is_fence = !is_panel && t.has_flag( "THIN_OBSTACLE" );
         const bool is_upright = upright_equipment_terrain( t );
@@ -3641,7 +4324,10 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
     // Structural LOD uses the near renderer's bg/fg layering, but keeps one
     // sprite variant per terrain and avoids distant neighbor/orientation work.
     const auto gather_structure_tile = [&]( const ter_t & t, const tripoint_bub_ms & p,
-    const point d, const float wz ) -> bool {
+    const point d, float wz, const graded_surface *grade ) -> bool {
+        g_emit_logical_z = wz;
+        wz += terrain_height_offset( here.get_abs( p ), grade );
+        const bool deform_floor = terrain_height_enabled() && p.z() == 0 && !grade;
         const structure_traits &traits = structure_traits_for( t, p );
         if( traits.no_floor && !traits.is_tree && !traits.is_shrub )
         {
@@ -3651,10 +4337,21 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
         if( traits.draw_floor && count < MAX_DRAW_INSTANCES )
         {
             const auto &color = traits.ground_color;
-            std::vector<float> &v = bucket_for( MODE_BOX, traits.ground_sprite.atlas );
-            push_lod_instance( v, static_cast<float>( d.x ), static_cast<float>( d.y ),
-                               wz - FLOOR_THICK - 0.001f, 1.0f, 1.0f, FLOOR_THICK,
-                               traits.ground_sprite, color[0], color[1], color[2], true );
+            if( deform_floor && !traits.is_water ) {
+                push_grid_ground( d.x, d.y, traits.ground_sprite, color[0], color[1], color[2],
+                                  0, false, 1.0f, false, true );
+            } else if( deform_floor ) {
+                std::vector<float> &v = bucket_for( MODE_FLATQUAD, traits.ground_sprite.atlas );
+                push_lod_instance( v, static_cast<float>( d.x ), static_cast<float>( d.y ),
+                                   wz - 0.001f, 1.0f, 1.0f, 1.0f, traits.ground_sprite,
+                                   color[0], color[1], color[2], true );
+                mark_terrain_height( v );
+            } else {
+                std::vector<float> &v = bucket_for( MODE_BOX, traits.ground_sprite.atlas );
+                push_lod_instance( v, static_cast<float>( d.x ), static_cast<float>( d.y ),
+                                   wz - FLOOR_THICK - 0.001f, 1.0f, 1.0f, FLOOR_THICK,
+                                   traits.ground_sprite, color[0], color[1], color[2], true );
+            }
             ++count;
             drew = true;
         }
@@ -3665,6 +4362,9 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
             push_lod_instance( v, static_cast<float>( d.x ), static_cast<float>( d.y ),
                                wz + 0.004f, 1.0f, 1.0f, 1.0f, traits.object_sprite,
                                color[0], color[1], color[2] );
+            if( deform_floor ) {
+                mark_terrain_height( v );
+            }
             ++count;
             drew = true;
         }
@@ -3676,7 +4376,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                1.0f, 1.0f, WALL_HEIGHT, traits.object_sprite,
                                color[0], color[1], color[2], true );
             mark_sun_transparent( v, traits.sun_transparent, traits.sun_portal );
-            mark_same_level_wall( v, wz == 0.0f );
+            mark_same_level_wall( v, g_emit_logical_z == 0.0f );
             ++count;
             drew = true;
         }
@@ -3830,7 +4530,12 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
     // read as structure there, while remembered furniture would only clutter
     // the cross-level view.
     const auto gather_memory_tile = [&]( const tripoint_bub_ms & p, const point d,
-    const float wz, const bool with_furniture ) -> bool {
+    float wz, const bool with_furniture, const graded_surface *grade = nullptr ) -> bool {
+        g_emit_logical_z = wz;
+        wz += grade ? terrain_height_offset( here.get_abs( p ), grade ) :
+              terrain_height_offset( here, p );
+        const graded_surface *active_grade = grade ? grade : terrain_grade_at( here, p );
+        const bool deform_floor = terrain_height_enabled() && p.z() == 0 && !active_grade;
         const int &dx = d.x;
         const int &dy = d.y;
         const memorized_tile &mt = get_avatar().get_memorized_tile( here.get_abs( p ) );
@@ -4025,6 +4730,9 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
             push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
                            wz - 0.001f, 1.0f, 1.0f, 1.0f, ground_spr, gr, gg, gb,
                            false, ground_rot4, false, -1.0f, false, 1.0f, true );
+            if( deform_floor ) {
+                mark_terrain_height( v );
+            }
             ++count;
         } else if( !is_empty_frame && ( !is_flat_utility || ground_tex ) &&
                    ( ground_tex || !skip_untextured_terrain_surface( t ) ) )
@@ -4036,10 +4744,17 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
             gspr.v0 = ground_spr.gv0;
             gspr.u1 = ground_spr.gu1;
             gspr.v1 = ground_spr.gv1;
-            std::vector<float> &v = bucket_for( MODE_BOX, ground_tex ? gspr.atlas : nullptr );
-            push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
-                           wz - FLOOR_THICK - 0.001f, 1.0f, 1.0f, FLOOR_THICK, gspr,
-                           gr, gg, gb, true, ground_rot4, false, -1.0f, false, 1.0f, true );
+            if( !ground_tex ) {
+                gspr.atlas = nullptr;
+            }
+            if( deform_floor ) {
+                push_grid_ground( dx, dy, gspr, gr, gg, gb, ground_rot4, false, 1.0f, true );
+            } else {
+                std::vector<float> &v = bucket_for( MODE_BOX, ground_tex ? gspr.atlas : nullptr );
+                push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
+                               wz - FLOOR_THICK - 0.001f, 1.0f, 1.0f, FLOOR_THICK, gspr,
+                               gr, gg, gb, true, ground_rot4, false, -1.0f, false, 1.0f, true );
+            }
             ++count;
         }
 
@@ -4127,7 +4842,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                     push_instance( v, px, py, wz + SILL_H, psx, psy, SILL_H, facespr,
                                    pr, pg, pb, false, 0, false, -1.0f, false, 1.0f, true );
                     mark_sun_transparent( v, sun_transparent, is_panel );
-                    mark_same_level_wall( v, wz == 0.0f );
+                    mark_same_level_wall( v, g_emit_logical_z == 0.0f );
                     ++count;
                 }
                 if( layered_face && ftex && count < MAX_DRAW_INSTANCES ) {
@@ -4144,7 +4859,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                     push_instance( vo, opx, opy, wz + SILL_H, osx, osy, SILL_H, fspr,
                                    1.0f, 1.0f, 1.0f,
                                    false, 0, false, -1.0f, false, 1.0f, true );
-                    mark_same_level_wall( vo, wz == 0.0f );
+                    mark_same_level_wall( vo, g_emit_logical_z == 0.0f );
                     ++count;
                 }
                 if( wok && count + 2 <= MAX_DRAW_INSTANCES ) {
@@ -4157,12 +4872,12 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                    wz, 1.0f, 1.0f, SILL_H, sill,
                                    1.0f, 1.0f, 1.0f,
                                    false, 0, false, -1.0f, false, 1.0f, true );
-                    mark_same_level_wall( vb, wz == 0.0f );
+                    mark_same_level_wall( vb, g_emit_logical_z == 0.0f );
                     push_instance( vb, static_cast<float>( dx ), static_cast<float>( dy ),
                                    wz + SILL_H * 2.0f, 1.0f, 1.0f, WALL_HEIGHT - SILL_H * 2.0f,
                                    lintel, 1.0f, 1.0f, 1.0f,
                                    false, 0, false, -1.0f, false, 1.0f, true );
-                    mark_same_level_wall( vb, wz == 0.0f );
+                    mark_same_level_wall( vb, g_emit_logical_z == 0.0f );
                     count += 2;
                 }
             } else {
@@ -4170,7 +4885,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                     push_instance( v, px, py, wz, psx, psy, PANEL_HEIGHT, facespr,
                                    pr, pg, pb, false, 0, false, -1.0f, false, 1.0f, true );
                     mark_sun_transparent( v, sun_transparent, is_panel );
-                    mark_same_level_wall( v, wz == 0.0f );
+                    mark_same_level_wall( v, g_emit_logical_z == 0.0f );
                     ++count;
                 }
                 if( layered_face && ftex && count < MAX_DRAW_INSTANCES ) {
@@ -4187,7 +4902,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                     const float opy = ew_line ? py - grow * 0.5f : py;
                     push_instance( vo, opx, opy, wz, osx, osy, PANEL_HEIGHT, fspr,
                                    1.0f, 1.0f, 1.0f, false, 0, false, -1.0f, false, 1.0f, true );
-                    mark_same_level_wall( vo, wz == 0.0f );
+                    mark_same_level_wall( vo, g_emit_logical_z == 0.0f );
                     ++count;
                 }
                 if( wok && count + 1 <= MAX_DRAW_INSTANCES ) {
@@ -4197,7 +4912,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                    wz + PANEL_HEIGHT, 1.0f, 1.0f, WALL_HEIGHT - PANEL_HEIGHT,
                                    lintel, 1.0f, 1.0f, 1.0f,
                                    false, 0, false, -1.0f, false, 1.0f, true );
-                    mark_same_level_wall( vb, wz == 0.0f );
+                    mark_same_level_wall( vb, g_emit_logical_z == 0.0f );
                     ++count;
                 }
             }
@@ -4233,7 +4948,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                 push_instance( v, dx + 0.5f, dy + 0.5f, wz, 1.0f, fh, 1.0f,
                                fspr, or_, og, ob, false, 0, false, run_ns ? 1.0f : 0.0f,
                                false, 1.0f, true );
-                mark_same_level_wall( v, wz == 0.0f );
+                mark_same_level_wall( v, g_emit_logical_z == 0.0f );
                 ++count;
             } else {
                 sprite_info hspr = fspr;
@@ -4243,25 +4958,25 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                 if( cn ) {
                     push_instance( v, fcx, fcy - 0.25f, wz, 0.5f, fh, 1.0f, hspr,
                                    or_, og, ob, false, 0, false, 1.0f, false, 1.0f, true );
-                    mark_same_level_wall( v, wz == 0.0f );
+                    mark_same_level_wall( v, g_emit_logical_z == 0.0f );
                     ++count;
                 }
                 if( cs ) {
                     push_instance( v, fcx, fcy + 0.25f, wz, 0.5f, fh, 1.0f, hspr,
                                    or_, og, ob, false, 0, false, 1.0f, false, 1.0f, true );
-                    mark_same_level_wall( v, wz == 0.0f );
+                    mark_same_level_wall( v, g_emit_logical_z == 0.0f );
                     ++count;
                 }
                 if( ce ) {
                     push_instance( v, fcx + 0.25f, fcy, wz, 0.5f, fh, 1.0f, hspr,
                                    or_, og, ob, false, 0, false, 0.0f, false, 1.0f, true );
-                    mark_same_level_wall( v, wz == 0.0f );
+                    mark_same_level_wall( v, g_emit_logical_z == 0.0f );
                     ++count;
                 }
                 if( cw ) {
                     push_instance( v, fcx - 0.25f, fcy, wz, 0.5f, fh, 1.0f, hspr,
                                    or_, og, ob, false, 0, false, 0.0f, false, 1.0f, true );
-                    mark_same_level_wall( v, wz == 0.0f );
+                    mark_same_level_wall( v, g_emit_logical_z == 0.0f );
                     ++count;
                 }
             }
@@ -4272,7 +4987,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                            1.0f, 1.0f, WALL_HEIGHT, fspr, or_, og, ob,
                            false, 0, false, -1.0f, false, 1.0f, true );
             mark_sun_transparent( v, sun_transparent, is_panel );
-            mark_same_level_wall( v, wz == 0.0f );
+            mark_same_level_wall( v, g_emit_logical_z == 0.0f );
             ++count;
         }
 
@@ -4283,6 +4998,9 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
             push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
                            wz + 0.004f, 1.0f, 1.0f, 1.0f, fspr, or_, og, ob,
                            false, 0, false, -1.0f, false, 1.0f, true );
+            if( deform_floor ) {
+                mark_terrain_height( v );
+            }
             ++count;
         }
 
@@ -4292,7 +5010,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
 
     for( int zlev = zmin; zlev <= zmax; ++zlev ) {
         const int dz = zlev - cz;
-        const float wz = dz * LEVEL_HEIGHT;
+        float wz = dz * LEVEL_HEIGHT;
         const level_cache &cache = here.get_cache_ref( zlev );
         const region_cull_mask cull_mask = build_region_cull_mask( here, you, center, zlev,
                                            lowest_vis_z, vis_vars, frustum, caster_frustum );
@@ -4304,6 +5022,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
 
         for( int dy = -VIEW_RADIUS; dy <= VIEW_RADIUS; ++dy ) {
             for( int dx = -VIEW_RADIUS; dx <= VIEW_RADIUS; ++dx ) {
+                wz = dz * LEVEL_HEIGHT;
                 if( count >= MAX_DRAW_INSTANCES ) {
                     return count;
                 }
@@ -4344,6 +5063,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                     continue;
                 }
                 ++g_profile.main_tiles;
+                g_emit_logical_z = wz;
                 // per-tile lit level, the same one 2D draws from: fresh
                 // visibility_cache for the view level and below within the
                 // refreshed range; upper levels have no fresh cache
@@ -4373,7 +5093,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                     if( dz == 0 ) {
                         if( !gather_memory_tile( p, point( dx, dy ), wz, true ) &&
                             std::max( std::abs( dx ), std::abs( dy ) ) <= REGION_RADIUS ) {
-                            push_fog_slab( point( dx, dy ), wz );
+                            push_fog_slab( point( dx, dy ), wz + terrain_height_offset( here, p ) );
                         }
                     } else if( !( dz > 0 && !wall_extension &&
                                   dollhouse[( dy + REGION_RADIUS ) * REGION_SIZE + ( dx + REGION_RADIUS )] ) ) {
@@ -4400,6 +5120,9 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                 if( t == t_null ) {
                     continue;
                 }
+                wz += terrain_height_offset( here, p );
+                const bool deform_floor = terrain_height_enabled() && p.z() == 0 &&
+                                          !terrain_grade_at( here, p );
                 const std::array<float, 4> terrain_emission = emission_from_light(
                             t->light_emitted, t->light_color );
                 const bool is_water = t->has_flag( ter_furn_flag::TFLAG_SWIMMABLE ) ||
@@ -4637,6 +5360,9 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                        gr, gg, gb, false, ground_rot4, false, -1.0f, ghost,
                                        tone.sat, false, false, false, 0, terrain_emission,
                                        is_water );
+                        if( deform_floor ) {
+                            mark_terrain_height( v );
+                        }
                         ++count;
                     } else {
                         sprite_info gspr = ground_spr;
@@ -4644,12 +5370,29 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                         gspr.v0 = ground_spr.gv0;
                         gspr.u1 = ground_spr.gu1;
                         gspr.v1 = ground_spr.gv1;
-                        std::vector<float> &v = bucket_for( MODE_BOX, ground_tex ? gspr.atlas : nullptr );
-                        push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
-                                       wz - FLOOR_THICK - 0.001f, 1.0f, 1.0f, FLOOR_THICK, gspr,
-                                       gr, gg, gb, true, ground_rot4, false, -1.0f, ghost,
-                                       tone.sat, false, false, false, 0, terrain_emission,
-                                       is_water && !btex && !dtex );
+                        if( !ground_tex ) {
+                            gspr.atlas = nullptr;
+                        }
+                        if( deform_floor && !is_water ) {
+                            push_grid_ground( dx, dy, gspr, gr, gg, gb, ground_rot4, ghost, tone.sat,
+                                              false, false, terrain_emission, false );
+                        } else if( deform_floor ) {
+                            std::vector<float> &v = bucket_for( MODE_FLATQUAD,
+                                                                ground_tex ? gspr.atlas : nullptr );
+                            push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
+                                           wz - 0.001f, 1.0f, 1.0f, 1.0f, gspr,
+                                           gr, gg, gb, true, ground_rot4, false, -1.0f, ghost,
+                                           tone.sat, false, false, false, 0, terrain_emission,
+                                           is_water && !btex && !dtex );
+                            mark_terrain_height( v );
+                        } else {
+                            std::vector<float> &v = bucket_for( MODE_BOX, ground_tex ? gspr.atlas : nullptr );
+                            push_instance( v, static_cast<float>( dx ), static_cast<float>( dy ),
+                                           wz - FLOOR_THICK - 0.001f, 1.0f, 1.0f, FLOOR_THICK, gspr,
+                                           gr, gg, gb, true, ground_rot4, false, -1.0f, ghost,
+                                           tone.sat, false, false, false, 0, terrain_emission,
+                                           is_water && !btex && !dtex );
+                        }
                         ++count;
                     }
                 }
@@ -4681,6 +5424,9 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                                    wz + 0.004f, 1.0f, 1.0f, 1.0f, fspr, or_, og, ob,
                                    false, 0, false, -1.0f, ghost, tone.sat,
                                    false, false, false, 0, terrain_emission, is_water );
+                    if( deform_floor ) {
+                        mark_terrain_height( v );
+                    }
                     ++count;
                 }
 
@@ -6065,6 +6811,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
     auto push_entity = [&]( const Creature & critter, const tripoint_bub_ms & p,
                             const float dx, const float dy, const float wz,
     const tile_tone & tone ) {
+        g_emit_logical_z = wz;
         std::string sprite_id;
         TILE_CATEGORY cat = TILE_CATEGORY::NONE;
         float size_scale = 1.0f;
@@ -6109,7 +6856,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
         const float ch = CREATURE_BASE_HEIGHT * size_scale;
         const float cw = ch * std::clamp( cspr.aspect, 0.4f, 2.5f );
         // canvas bottom of the body sprite, as the single-billboard path placed it
-        const float zbase = wz - ch * cspr.base_drop;
+        const float zbase = wz + terrain_height_offset( here, p ) - ch * cspr.base_drop;
         int creature_relation = CREATURE_NEUTRAL_FLAG;
         switch( critter.attitude_to( you ) ) {
             case Creature::Attitude::HOSTILE:
@@ -6343,6 +7090,7 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
             distant_terrain_snapshot &snapshot = existing->second;
             snapshot.geometry_stamp = stamp;
             snapshot.terrain.clear();
+            snapshot.grades.clear();
             snapshot.open_air = false;
             if( sm.is_uniform() )
             {
@@ -6352,10 +7100,20 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
             } else
             {
                 snapshot.terrain.resize( SEEX * SEEY );
+                snapshot.grades.resize( SEEX * SEEY );
+                bool any_grade = false;
                 for( int y = 0; y < SEEY; ++y ) {
                     for( int x = 0; x < SEEX; ++x ) {
-                        snapshot.terrain[y * SEEX + x] = sm.get_ter( point_sm_ms( x, y ) );
+                        const point_sm_ms local( x, y );
+                        snapshot.terrain[y * SEEX + x] = sm.get_ter( local );
+                        const graded_surface *grade = sm.get_grade( local );
+                        snapshot.grades[y * SEEX + x] = grade ? *grade :
+                        graded_surface{ std::numeric_limits<int>::min(), 0 };
+                        any_grade = any_grade || grade;
                     }
+                }
+                if( !any_grade ) {
+                    snapshot.grades.clear();
                 }
             }
             far_missing.erase( p );
@@ -6455,6 +7213,8 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                 if( !gray_visible && !memory_possible ) {
                     continue;
                 }
+                const distant_terrain_snapshot *ground_snapshot = far_z_min <= 0 ?
+                        snapshot_for( tripoint_abs_sm( column_pos.x(), column_pos.y(), 0 ) ) : nullptr;
                 for( int zlev = far_z_min; zlev <= far_z_max; ++zlev ) {
                     if( count >= MAX_DRAW_INSTANCES ) {
                         return count;
@@ -6490,17 +7250,22 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
                             }
                             ++g_profile.far_tiles;
                             const tripoint_abs_ms abs_p = sm_abs + point_rel_ms( lx, ly );
+                            const graded_surface *grade = snapshot ? snapshot->grade_at( point_sm_ms( lx, ly ) ) :
+                                                          nullptr;
+                            if( !grade && zlev > 0 && ground_snapshot ) {
+                                grade = ground_snapshot->grade_at( point_sm_ms( lx, ly ) );
+                            }
                             if( has_memory && range2 <= FAR_MEMORY_RADIUS * FAR_MEMORY_RADIUS ) {
                                 const memorized_tile &mem = you.get_memorized_tile( abs_p );
                                 if( !mem.get_ter_id().empty() || !mem.get_dec_id().empty() ) {
-                                    gather_memory_tile( here.get_bub( abs_p ), d, wz, zlev <= cz );
+                                    gather_memory_tile( here.get_bub( abs_p ), d, wz, zlev <= cz, grade );
                                     continue;
                                 }
                             }
                             if( gray_visible && snapshot && !uniform_open_air ) {
                                 const ter_id t = snapshot->terrain_at( point_sm_ms( lx, ly ) );
                                 if( t ) {
-                                    gather_structure_tile( t.obj(), here.get_bub( abs_p ), d, wz );
+                                    gather_structure_tile( t.obj(), here.get_bub( abs_p ), d, wz, grade );
                                 }
                             }
                         }
@@ -6654,10 +7419,12 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
 
     // World-space north compass: a waist-height northern arc and a camera-facing
     // N at negative map y. Orbiting the camera never changes their orientation.
+    g_emit_logical_z = std::numeric_limits<float>::quiet_NaN();
     if( upos.z() == center.z() && g_ctx.compass_tex && count + 2 <= MAX_DRAW_INSTANCES ) {
         const float pcx = static_cast<float>( upos.x() - center.x() ) + 0.5f;
         const float pcy = static_cast<float>( upos.y() - center.y() ) + 0.5f;
-        const float compass_z = ( upos.z() - cz ) * LEVEL_HEIGHT + COMPASS_WAIST_Z;
+        const float compass_z = ( upos.z() - cz ) * LEVEL_HEIGHT +
+                                terrain_height_offset( here, upos ) + COMPASS_WAIST_Z;
         sprite_info arc;
         arc.atlas = g_ctx.compass_tex;
         arc.u1 = 1.0f;
@@ -6686,11 +7453,13 @@ int gather_instances( cata_tiles *tiles, const tripoint_bub_ms &center,
             return;
         }
         const tripoint_rel_ms rel = tp - center;
+        g_emit_logical_z = ( tp.z() - cz ) * LEVEL_HEIGHT;
+        const float cursor_z = g_emit_logical_z + terrain_height_offset( here, tp ) + 0.002f;
         sprite_info cspr;
         const bool ctex = lookup_sprite( tiles, sprite, TILE_CATEGORY::NONE, tp, cspr );
         std::vector<float> &v = bucket_for( MODE_BOX, ctex ? cspr.atlas : nullptr );
         push_instance( v, static_cast<float>( rel.x() ), static_cast<float>( rel.y() ),
-                       0.002f, 1.0f, 1.0f, 0.05f, cspr, 1.0f, 1.0f, 1.0f );
+                       cursor_z, 1.0f, 1.0f, 0.05f, cspr, 1.0f, 1.0f, 1.0f );
         ++count;
     };
     // Match the native tiles vehicle indicator: the next facing, ten tiles
@@ -6959,6 +7728,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     if( profile ) {
         g_profile.memory_ms = profile_ms( memory_begin, profile_ticks( true ) );
     }
+    prepare_terrain_height( here, center );
 
     // The camera is needed by the gather as well as the draw. Building it here
     // lets invisible/offscreen tiles avoid map and sprite work entirely.
@@ -6975,8 +7745,10 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     // The orbit camera stays at least 6 units away; near=0.5 preserves far-depth
     // precision for ground decals viewed from upper levels.
     constexpr float camera_near = 0.5f;
+    const float height_relief = terrain_height_enabled() ?
+                                std::max( std::abs( g_terrain_height.min_z ), std::abs( g_terrain_height.max_z ) ) : 0.0f;
     const float camera_far = std::max( 300.0f,
-                                       static_cast<float>( FAR_SUBMAP_RADIUS + 64 ) );
+                                       static_cast<float>( FAR_SUBMAP_RADIUS + 64 ) + 2.0f * height_relief );
     const mat4 proj = mat4_perspective( 40.0f * 3.14159265f / 180.0f,
                                         static_cast<float>( w ) / static_cast<float>( h ),
                                         camera_near, camera_far );
@@ -7004,9 +7776,11 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
                         std::cos( visual_sun_az ) * std::cos( visual_sun_alt ),
                         std::sin( visual_sun_alt ) };
     const float shadow_extent = std::clamp( g_cam_dist * 2.2f, 32.0f, 72.0f );
-    const vec3 light_eye{ target.x + sun_dir.x * 80.0f,
-                          target.y + sun_dir.y * 80.0f,
-                          target.z + sun_dir.z * 80.0f };
+    const float light_distance = 80.0f + 2.0f * height_relief;
+    const float shadow_depth = 180.0f + 4.0f * height_relief;
+    const vec3 light_eye{ target.x + sun_dir.x * light_distance,
+                          target.y + sun_dir.y * light_distance,
+                          target.z + sun_dir.z * light_distance };
     const vec3 light_up = std::abs( sun_dir.z ) > 0.95f ? vec3{ 0.0f, 1.0f, 0.0f } :
                           vec3{ 0.0f, 0.0f, 1.0f };
     const mat4 light_view = mat4_lookat( light_eye, target, light_up );
@@ -7015,7 +7789,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     const float light_cx = std::round( light_center[0] / shadow_texel ) * shadow_texel;
     const float light_cy = std::round( light_center[1] / shadow_texel ) * shadow_texel;
     const mat4 light_proj = mat4_ortho( light_cx - shadow_extent, light_cx + shadow_extent,
-                                        light_cy - shadow_extent, light_cy + shadow_extent, 0.5f, 180.0f );
+                                        light_cy - shadow_extent, light_cy + shadow_extent, 0.5f, shadow_depth );
     const mat4 light_vp = mat4_mul( light_proj, light_view );
     const view_frustum shadow_frustum = make_view_frustum( light_vp );
     const view_frustum *caster_frustum = sun_up && g_ctx.shadow_pipeline && g_ctx.shadow_sampler
@@ -7162,6 +7936,26 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         i = j;
     }
 
+    struct terrain_grid_segment {
+        SDL_Texture *atlas;
+        Uint32 first_index;
+        Uint32 num_indices;
+    };
+    static std::vector<terrain_grid_segment> grid_segments;
+    static std::vector<Uint32> grid_indices;
+    grid_segments.clear();
+    grid_indices.clear();
+    for( size_t i = 0; i < g_terrain_grid.bucket_count; ++i ) {
+        const terrain_grid_bucket &bucket = g_terrain_grid.buckets[i];
+        if( bucket.indices.empty() ) {
+            continue;
+        }
+        grid_segments.push_back( { bucket.atlas, static_cast<Uint32>( grid_indices.size() ),
+                                   static_cast<Uint32>( bucket.indices.size() ) } );
+        grid_indices.insert( grid_indices.end(), bucket.indices.begin(), bucket.indices.end() );
+    }
+    g_profile.grid_indices = grid_indices.size();
+
     if( profile ) {
         g_profile.assembly_ms = profile_ms( assembly_begin, profile_ticks( true ) );
     }
@@ -7259,8 +8053,9 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> sun_dir; // xyz = toward sun, w = sun is up
         std::array<float, 4> water_vertex; // xy = map origin, z = seconds, w = height amplitude
         std::array<float, 4> water_flow; // xy = world wind direction, z = normalized speed
+        std::array<float, 4> height_mapping; // xy = scene origin, z = reserved, w = enabled
     };
-    static_assert( sizeof( vert_uniforms ) == 10 * 16, "terrain3d vertex UBO must match std140" );
+    static_assert( sizeof( vert_uniforms ) == 11 * 16, "terrain3d vertex UBO must match std140" );
     vert_uniforms uniforms{};
     uniforms.mvp = mvp;
     // physical camera right on the ground plane: cross( up, forward ) with
@@ -7274,6 +8069,10 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     uniforms.water_flow = { wind_dir.x, wind_dir.y,
                             std::clamp( weather.windspeed / 20.0f, 0.0f, 1.0f ), 0.0f
                           };
+    uniforms.height_mapping = { static_cast<float>( TERRAIN_HEIGHT_ORIGIN ),
+                                static_cast<float>( TERRAIN_HEIGHT_ORIGIN ), -center.z() * LEVEL_HEIGHT,
+                                terrain_height_enabled() ? 1.0f : 0.0f
+                              };
     vert_uniforms shadow_uniforms = uniforms;
     shadow_uniforms.mvp = light_vp;
 
@@ -7376,11 +8175,13 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> lighting_params;
         std::array<float, 4> mask_mapping;
         std::array<float, 4> bounce_params;
+        std::array<float, 4> grid_mapping;
     };
-    static_assert( sizeof( frag_uniforms ) == 30 * 16, "terrain3d fragment UBO must match std140" );
+    static_assert( sizeof( frag_uniforms ) == 31 * 16, "terrain3d fragment UBO must match std140" );
     frag_uniforms frag_ub{};
     const tripoint_bub_ms upos = get_avatar().pos_bub();
-    const float player_gz = ( upos.z() - center.z() ) * LEVEL_HEIGHT;
+    const float player_gz = ( upos.z() - center.z() ) * LEVEL_HEIGHT +
+                            terrain_height_offset( here, upos );
     frag_ub.eye_pos = { eye.x, eye.y, eye.z, 0.0f };
     frag_ub.player_pos = { ( upos.x() - center.x() ) + 0.5f,
                            ( upos.y() - center.y() ) + 0.5f,
@@ -7417,7 +8218,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     frag_ub.effect_params = { 0.075f, 0.10f, 1.0f / WALL_HEIGHT, 0.0f };
     frag_ub.light_vp = light_vp;
     frag_ub.shadow_params = { 0.0f, 1.0f / SHADOW_MAP_SIZE, 0.00035f, 0.0f };
-    frag_ub.shadow_pcss = { 2.0f * shadow_extent, 180.0f - 0.5f, 0.0093f, 8.0f };
+    frag_ub.shadow_pcss = { 2.0f * shadow_extent, shadow_depth - 0.5f, 0.0093f, 8.0f };
     frag_ub.light_params = { 0.0f, static_cast<float>( MAPSIZE_Y ),
                              static_cast<float>( center.z() + OVERMAP_DEPTH ), LEVEL_HEIGHT
                            };
@@ -7455,6 +8256,11 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
                              LEVEL_HEIGHT, static_cast<float>( WEATHER_MASK_LAYERS )
                            };
     frag_ub.bounce_params = { 0.0f, 2.75f, 2.2f, 0.0f };
+    frag_ub.grid_mapping = { static_cast<float>( TERRAIN_HEIGHT_ORIGIN ),
+                             static_cast<float>( TERRAIN_HEIGHT_ORIGIN ),
+                             static_cast<float>( TERRAIN_HEIGHT_SIZE ),
+                             g_terrain_grid.empty() ? 0.0f : 1.0f
+                           };
     water_ub.sunlight_color = frag_ub.sunlight_color;
 
     struct post_uniforms {
@@ -7521,8 +8327,9 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> ray_params;
         std::array<float, 4> mask_mapping;
         std::array<float, 4> bounce_params;
+        std::array<float, 4> height_mapping;
     };
-    static_assert( sizeof( bounce_apply_uniforms ) == 7 * 16,
+    static_assert( sizeof( bounce_apply_uniforms ) == 8 * 16,
                    "sun-bounce apply UBO must match std140" );
     bounce_apply_uniforms bounce_apply_ub{};
     bounce_apply_ub.eye_pos = sky_ub.eye_pos;
@@ -7532,6 +8339,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
     bounce_apply_ub.ray_params = water_ub.ray_params;
     bounce_apply_ub.mask_mapping = frag_ub.mask_mapping;
     bounce_apply_ub.bounce_params = { 0.55f, 45.0f, 95.0f, 0.0f };
+    bounce_apply_ub.height_mapping = uniforms.height_mapping;
 
     struct precipitation_uniforms {
         mat4 view_proj;
@@ -7543,8 +8351,9 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         std::array<float, 4> mask_mapping;
         std::array<float, 4> cam_right;
         std::array<float, 4> cam_up;
+        std::array<float, 4> height_mapping;
     };
-    static_assert( sizeof( precipitation_uniforms ) == 12 * 16,
+    static_assert( sizeof( precipitation_uniforms ) == 13 * 16,
                    "precipitation UBO must match std140" );
     precipitation_uniforms precipitation_ub{};
     precipitation_ub.view_proj = mvp;
@@ -7560,6 +8369,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
                                     };
     precipitation_ub.cam_right = sky_ub.cam_right;
     precipitation_ub.cam_up = sky_ub.cam_up;
+    precipitation_ub.height_mapping = uniforms.height_mapping;
 
     // fallback clear color when the sky pass is unavailable
     const SDL_FColor sky{ 0.02f + 0.35f * daylight, 0.02f + 0.45f * daylight,
@@ -7590,6 +8400,25 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         return;
     }
 
+    const bool terrain_height_ready = upload_terrain_height( cmd, slot );
+    if( !terrain_height_ready ) {
+        uniforms.height_mapping[3] = 0.0f;
+        shadow_uniforms.height_mapping[3] = 0.0f;
+        static bool height_upload_logged = false;
+        if( !height_upload_logged ) {
+            height_upload_logged = true;
+            write_status( "terrain-height upload failed; using tile-center heights" );
+        }
+    }
+    const bool terrain_grid_ready = upload_terrain_grid( cmd, slot, grid_indices );
+    if( !terrain_grid_ready ) {
+        grid_segments.clear();
+        static bool grid_upload_logged = false;
+        if( !grid_upload_logged ) {
+            grid_upload_logged = true;
+            write_status( "terrain grid upload failed; grid ground skipped" );
+        }
+    }
     const bool scene_light_ready = upload_scene_light( cmd, slot, here );
     frag_ub.light_params[0] = scene_light_ready ? 1.0f : 0.0f;
     const float precipitation_strength = weather_state.rain + weather_state.snow;
@@ -7726,7 +8555,20 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         shadow_depth.store_op = SDL_GPU_STOREOP_STORE;
         shadow_depth.clear_depth = 1.0f;
         SDL_GPURenderPass *shadow_pass = SDL_BeginGPURenderPass( cmd, nullptr, 0, &shadow_depth );
+        if( terrain_grid_ready && !grid_segments.empty() && g_ctx.terrain_grid_shadow_pipeline ) {
+            SDL_BindGPUGraphicsPipeline( shadow_pass, g_ctx.terrain_grid_shadow_pipeline );
+            bind_terrain_height_vertex( shadow_pass, slot );
+            SDL_GPUBufferBinding index_bind{};
+            index_bind.buffer = slot.terrain_grid_ib;
+            SDL_BindGPUIndexBuffer( shadow_pass, &index_bind, SDL_GPU_INDEXELEMENTSIZE_32BIT );
+            shadow_uniforms.params = { 0.0f, 0.0f, 0.0f, 0.0f };
+            SDL_PushGPUVertexUniformData( cmd, 0, &shadow_uniforms, sizeof( shadow_uniforms ) );
+            for( const terrain_grid_segment &seg : grid_segments ) {
+                SDL_DrawGPUIndexedPrimitives( shadow_pass, seg.num_indices, 1, seg.first_index, 0, 0 );
+            }
+        }
         SDL_BindGPUGraphicsPipeline( shadow_pass, g_ctx.shadow_pipeline );
+        bind_terrain_height_vertex( shadow_pass, slot );
         SDL_GPUBufferBinding shadow_inst_bind{};
         shadow_inst_bind.buffer = slot.instance_vb;
         for( const draw_segment &seg : segments ) {
@@ -7773,10 +8615,40 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         prepass_depth.store_op = SDL_GPU_STOREOP_STORE;
         prepass_depth.clear_depth = 1.0f;
         SDL_GPURenderPass *prepass = SDL_BeginGPURenderPass( cmd, nullptr, 0, &prepass_depth );
-        SDL_BindGPUGraphicsPipeline( prepass, g_ctx.prepass_pipeline );
         SDL_GPUBufferBinding inst_bind{};
         inst_bind.buffer = slot.instance_vb;
         frag_ub.effect_params[3] = 1.0f;
+        if( terrain_grid_ready && !grid_segments.empty() && g_ctx.terrain_grid_prepass_pipeline ) {
+            SDL_BindGPUGraphicsPipeline( prepass, g_ctx.terrain_grid_prepass_pipeline );
+            bind_terrain_height_vertex( prepass, slot );
+            SDL_GPUBufferBinding index_bind{};
+            index_bind.buffer = slot.terrain_grid_ib;
+            SDL_BindGPUIndexBuffer( prepass, &index_bind, SDL_GPU_INDEXELEMENTSIZE_32BIT );
+            for( const terrain_grid_segment &seg : grid_segments ) {
+                SDL_GPUTexture *atlas_gpu = seg.atlas ? gpu_texture_of( seg.atlas ) : g_ctx.fallback_tex;
+                std::array<SDL_GPUTextureSamplerBinding, 6> sampler_binds{};
+                sampler_binds[0].texture = atlas_gpu ? atlas_gpu : g_ctx.fallback_tex;
+                sampler_binds[0].sampler = g_ctx.sampler;
+                sampler_binds[1].texture = shadows_ready ? slot.shadow_tex : g_ctx.fallback_tex;
+                sampler_binds[1].sampler = shadows_ready ? g_ctx.shadow_sampler : g_ctx.sampler;
+                sampler_binds[2].texture = scene_light_ready ? slot.light_tex : g_ctx.fallback_tex;
+                sampler_binds[2].sampler = g_ctx.sampler;
+                sampler_binds[3].texture = g_ctx.fallback_tex;
+                sampler_binds[3].sampler = g_ctx.linear_sampler;
+                sampler_binds[4].texture = weather_mask_ready ? slot.weather_mask_tex : g_ctx.fallback_tex;
+                sampler_binds[4].sampler = g_ctx.sampler;
+                sampler_binds[5].texture = slot.terrain_grid_material_tex;
+                sampler_binds[5].sampler = g_ctx.sampler;
+                SDL_BindGPUFragmentSamplers( prepass, 0, sampler_binds.data(), sampler_binds.size() );
+                uniforms.params = { 0.0f, 0.0f, 0.0f, 0.0f };
+                SDL_PushGPUVertexUniformData( cmd, 0, &uniforms, sizeof( uniforms ) );
+                frag_ub.mask_params[3] = 1.0f;
+                SDL_PushGPUFragmentUniformData( cmd, 0, &frag_ub, sizeof( frag_ub ) );
+                SDL_DrawGPUIndexedPrimitives( prepass, seg.num_indices, 1, seg.first_index, 0, 0 );
+            }
+        }
+        SDL_BindGPUGraphicsPipeline( prepass, g_ctx.prepass_pipeline );
+        bind_terrain_height_vertex( prepass, slot );
         for( const draw_segment &seg : segments ) {
             if( seg.mode == MODE_FLATQUAD_DECAL || seg.mode == MODE_LINEQUAD_DECAL ) {
                 continue;
@@ -7799,7 +8671,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
             const SDL_GPUBufferBinding vbs[2] = { geom_bind, inst_bind };
             SDL_BindGPUVertexBuffers( prepass, 0, vbs, 2 );
             SDL_GPUTexture *atlas_gpu = seg.atlas ? gpu_texture_of( seg.atlas ) : g_ctx.fallback_tex;
-            std::array<SDL_GPUTextureSamplerBinding, 5> sampler_binds{};
+            std::array<SDL_GPUTextureSamplerBinding, 6> sampler_binds{};
             sampler_binds[0].texture = atlas_gpu ? atlas_gpu : g_ctx.fallback_tex;
             sampler_binds[0].sampler = g_ctx.sampler;
             sampler_binds[1].texture = shadows_ready ? slot.shadow_tex : g_ctx.fallback_tex;
@@ -7810,6 +8682,9 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
             sampler_binds[3].sampler = g_ctx.linear_sampler;
             sampler_binds[4].texture = weather_mask_ready ? slot.weather_mask_tex : g_ctx.fallback_tex;
             sampler_binds[4].sampler = g_ctx.sampler;
+            sampler_binds[5].texture = slot.terrain_grid_material_tex ? slot.terrain_grid_material_tex :
+                                       g_ctx.fallback_tex;
+            sampler_binds[5].sampler = g_ctx.sampler;
             SDL_BindGPUFragmentSamplers( prepass, 0, sampler_binds.data(), sampler_binds.size() );
             uniforms.params = { static_cast<float>( seg.mode ), 0.0f, 0.0f, 0.0f };
             SDL_PushGPUVertexUniformData( cmd, 0, &uniforms, sizeof( uniforms ) );
@@ -7873,7 +8748,39 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
 
     SDL_GPURenderPass *pass = SDL_BeginGPURenderPass( cmd, world_targets,
                                 mrt_active ? 2 : 1, &depth_target );
+    if( terrain_grid_ready && !grid_segments.empty() &&
+        ( mrt_active ? g_ctx.terrain_grid_pipeline_mrt : g_ctx.terrain_grid_pipeline ) ) {
+        SDL_BindGPUGraphicsPipeline( pass, mrt_active ? g_ctx.terrain_grid_pipeline_mrt :
+                                     g_ctx.terrain_grid_pipeline );
+        bind_terrain_height_vertex( pass, slot );
+        SDL_GPUBufferBinding index_bind{};
+        index_bind.buffer = slot.terrain_grid_ib;
+        SDL_BindGPUIndexBuffer( pass, &index_bind, SDL_GPU_INDEXELEMENTSIZE_32BIT );
+        for( const terrain_grid_segment &seg : grid_segments ) {
+            SDL_GPUTexture *atlas_gpu = seg.atlas ? gpu_texture_of( seg.atlas ) : g_ctx.fallback_tex;
+            std::array<SDL_GPUTextureSamplerBinding, 6> sampler_binds{};
+            sampler_binds[0].texture = atlas_gpu ? atlas_gpu : g_ctx.fallback_tex;
+            sampler_binds[0].sampler = g_ctx.sampler;
+            sampler_binds[1].texture = shadows_ready ? slot.shadow_tex : g_ctx.fallback_tex;
+            sampler_binds[1].sampler = shadows_ready ? g_ctx.shadow_sampler : g_ctx.sampler;
+            sampler_binds[2].texture = scene_light_ready ? slot.light_tex : g_ctx.fallback_tex;
+            sampler_binds[2].sampler = g_ctx.sampler;
+            sampler_binds[3].texture = ao_ready ? slot.ao_tex : g_ctx.fallback_tex;
+            sampler_binds[3].sampler = ao_ready ? g_ctx.linear_sampler : g_ctx.sampler;
+            sampler_binds[4].texture = weather_mask_ready ? slot.weather_mask_tex : g_ctx.fallback_tex;
+            sampler_binds[4].sampler = g_ctx.sampler;
+            sampler_binds[5].texture = slot.terrain_grid_material_tex;
+            sampler_binds[5].sampler = g_ctx.sampler;
+            SDL_BindGPUFragmentSamplers( pass, 0, sampler_binds.data(), sampler_binds.size() );
+            uniforms.params = { 0.0f, 0.0f, 0.0f, 0.0f };
+            SDL_PushGPUVertexUniformData( cmd, 0, &uniforms, sizeof( uniforms ) );
+            frag_ub.mask_params[3] = 1.0f;
+            SDL_PushGPUFragmentUniformData( cmd, 0, &frag_ub, sizeof( frag_ub ) );
+            SDL_DrawGPUIndexedPrimitives( pass, seg.num_indices, 1, seg.first_index, 0, 0 );
+        }
+    }
     SDL_BindGPUGraphicsPipeline( pass, mrt_active ? g_ctx.pipeline_mrt : g_ctx.pipeline );
+    bind_terrain_height_vertex( pass, slot );
     SDL_GPUBufferBinding inst_bind{};
     inst_bind.buffer = slot.instance_vb;
     inst_bind.offset = 0;
@@ -7909,7 +8816,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         const SDL_GPUBufferBinding vbs[2] = { geom_bind, inst_bind };
         SDL_BindGPUVertexBuffers( pass, 0, vbs, 2 );
         SDL_GPUTexture *atlas_gpu = seg.atlas ? gpu_texture_of( seg.atlas ) : g_ctx.fallback_tex;
-        std::array<SDL_GPUTextureSamplerBinding, 5> sampler_binds{};
+        std::array<SDL_GPUTextureSamplerBinding, 6> sampler_binds{};
         sampler_binds[0].texture = atlas_gpu ? atlas_gpu : g_ctx.fallback_tex;
         sampler_binds[0].sampler = g_ctx.sampler;
         sampler_binds[1].texture = shadows_ready ? slot.shadow_tex : g_ctx.fallback_tex;
@@ -7920,6 +8827,9 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         sampler_binds[3].sampler = ao_ready ? g_ctx.linear_sampler : g_ctx.sampler;
         sampler_binds[4].texture = weather_mask_ready ? slot.weather_mask_tex : g_ctx.fallback_tex;
         sampler_binds[4].sampler = g_ctx.sampler;
+        sampler_binds[5].texture = slot.terrain_grid_material_tex ? slot.terrain_grid_material_tex :
+                                   g_ctx.fallback_tex;
+        sampler_binds[5].sampler = g_ctx.sampler;
         SDL_BindGPUFragmentSamplers( pass, 0, sampler_binds.data(), sampler_binds.size() );
         // decal modes share their geometry path with the plain modes
         // (6 -> flatquad 5, 7 -> fence linequad 4); the shader never sees them
@@ -8024,7 +8934,7 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         apply_target.store_op = SDL_GPU_STOREOP_STORE;
         SDL_GPURenderPass *apply_pass = SDL_BeginGPURenderPass( cmd, &apply_target, 1, nullptr );
         SDL_BindGPUGraphicsPipeline( apply_pass, g_ctx.bounce_apply_pipeline );
-        SDL_GPUTextureSamplerBinding apply_samplers[4]{};
+        SDL_GPUTextureSamplerBinding apply_samplers[5]{};
         apply_samplers[0].texture = slot.bounce_raw_tex;
         apply_samplers[0].sampler = g_ctx.linear_sampler;
         apply_samplers[1].texture = slot.bounce_blur_tex[0];
@@ -8033,7 +8943,9 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         apply_samplers[2].sampler = g_ctx.sampler;
         apply_samplers[3].texture = slot.weather_mask_tex;
         apply_samplers[3].sampler = g_ctx.sampler;
-        SDL_BindGPUFragmentSamplers( apply_pass, 0, apply_samplers, 4 );
+        apply_samplers[4].texture = slot.terrain_height_tex ? slot.terrain_height_tex : g_ctx.fallback_tex;
+        apply_samplers[4].sampler = g_ctx.sampler;
+        SDL_BindGPUFragmentSamplers( apply_pass, 0, apply_samplers, 5 );
         SDL_PushGPUFragmentUniformData( cmd, 0, &bounce_apply_ub, sizeof( bounce_apply_ub ) );
         SDL_DrawGPUPrimitives( apply_pass, 3, 1, 0, 0 );
         SDL_EndGPURenderPass( apply_pass );
@@ -8051,10 +8963,12 @@ void draw_terrain_window( SDL_Renderer *renderer, const SDL_FRect &dest,
         SDL_GPURenderPass *precipitation_pass = SDL_BeginGPURenderPass( cmd, &precipitation_target, 1,
                                                 &precipitation_depth );
         SDL_BindGPUGraphicsPipeline( precipitation_pass, g_ctx.precipitation_pipeline );
-        SDL_GPUTextureSamplerBinding mask_sampler{};
-        mask_sampler.texture = slot.weather_mask_tex;
-        mask_sampler.sampler = g_ctx.sampler;
-        SDL_BindGPUFragmentSamplers( precipitation_pass, 0, &mask_sampler, 1 );
+        SDL_GPUTextureSamplerBinding mask_samplers[2]{};
+        mask_samplers[0].texture = slot.weather_mask_tex;
+        mask_samplers[0].sampler = g_ctx.sampler;
+        mask_samplers[1].texture = slot.terrain_height_tex ? slot.terrain_height_tex : g_ctx.fallback_tex;
+        mask_samplers[1].sampler = g_ctx.sampler;
+        SDL_BindGPUFragmentSamplers( precipitation_pass, 0, mask_samplers, 2 );
         for( int mode = 0; mode < 2; ++mode ) {
             const float strength = mode == 0 ? weather_state.rain : weather_state.snow;
             if( strength <= 0.001f ) {

@@ -16,6 +16,9 @@ layout(location = 6) in vec4 a_inst_color;
 layout(location = 7) in float a_inst_flags;
 layout(location = 8) in float a_inst_pad;
 layout(location = 9) in vec4 a_inst_emission;
+layout(location = 10) in float a_inst_logical_z;
+
+layout(set = 0, binding = 0) uniform sampler2D height_tex;
 
 layout(set = 1, binding = 0) uniform UBO {
     mat4 mvp;
@@ -25,7 +28,10 @@ layout(set = 1, binding = 0) uniform UBO {
     vec4 sun_dir;
     vec4 water_vertex;
     vec4 water_flow;
+    vec4 height_mapping;
 };
+
+#include "heightfield3d.glsl"
 
 layout(location = 1) out vec2 v_uv;
 layout(location = 2) out float v_flags;
@@ -101,6 +107,10 @@ void main()
         }
     }
     int flags = int( a_inst_flags + 0.5 );
+    if( height_mapping.w > 0.5 && ( flags & 262144 ) != 0 ) {
+        vec2 anchor_xy = a_inst_pos.xy + 0.5 * a_inst_scale.xy;
+        world.z += terrain_height_at( world.xy ) - terrain_height_at( anchor_xy );
+    }
     if( water_vertex.w > 0.0 && ( flags & 16384 ) != 0 &&
         ( mode == 5 || ( mode == 0 && a_aux.z > 0.5 ) ) ) {
         world.z += water_wave_height( world.xy + water_vertex.xy, water_flow.xy,

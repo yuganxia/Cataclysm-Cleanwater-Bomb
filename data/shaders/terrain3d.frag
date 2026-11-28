@@ -15,6 +15,7 @@ layout(set = 2, binding = 1) uniform sampler2D shadow_tex;
 layout(set = 2, binding = 2) uniform sampler2D light_tex;
 layout(set = 2, binding = 3) uniform sampler2D ao_tex;
 layout(set = 2, binding = 4) uniform sampler2D weather_mask_tex;
+layout(set = 2, binding = 5) uniform sampler2D grid_material_tex;
 
 layout(set = 3, binding = 0) uniform FragUBO {
     vec4 eye_pos;      // xyz = camera position (scene coords)
@@ -26,7 +27,7 @@ layout(set = 3, binding = 0) uniform FragUBO {
     vec4 memory_params; // x = named memory preset 0..3, y = 1 for the custom mixer
     vec4 memory_dark;   // rgb = custom dark color, w = gamma
     vec4 memory_light;  // rgb = custom light color
-    vec4 nv_params;     // x = 1 in a night vision frame (v_color.a then carries
+    vec4 nv_params;     // x = 1 in a night vision frame (instance_color.a then carries
                         // the tile light), y = night floor, z = overexpose start
     vec4 cursor_params; // xy = cursor in top-left screen UV, z = mask enabled
     vec4 effect_params; // xy = cursor ellipse radii, z = inverse full wall height, w = depth only
@@ -47,6 +48,7 @@ layout(set = 3, binding = 0) uniform FragUBO {
                           // z/w = shadow fade start/end in world units
     vec4 mask_mapping; // xy = map origin, z = level height, w = roof-mask layers
     vec4 bounce_params; // x = enabled, y = indoor penumbra multiplier, z = portal gain
+    vec4 grid_mapping; // xy = tile-grid origin, z = tile count per row, w = enabled
 };
 
 #include "weather3d.glsl"
@@ -60,6 +62,7 @@ layout(location = 5) in vec2 v_screen;
 layout(location = 6) in float v_wrap;
 layout(location = 7) in vec3 v_tile;
 layout(location = 8) in vec4 v_emission;
+layout(location = 9) in float v_grid;
 
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_emissive;
@@ -120,7 +123,7 @@ float sun_visibility( vec3 normal, vec3 light_dir )
     float world_gap = max( ( ndc.z - blocker_depth ) * shadow_pcss.y, 0.0 );
     float penumbra_scale = 1.0;
     if( bounce_params.x > 0.5 ) {
-        float indoor = 1.0 - weather_roof_exposure( v_world );
+        float indoor = 1.0 - weather_roof_exposure( vec3( v_world.xy, v_tile.z ) );
         penumbra_scale = mix( 1.0, bounce_params.y, indoor );
     }
     float penumbra_world = world_gap * shadow_pcss.z * penumbra_scale;
@@ -253,7 +256,31 @@ vec3 apply_air_perspective( vec3 rgb )
 void main()
 {
     out_emissive = vec4( 0.0 );
+    vec4 instance_color = v_color;
+    vec2 instance_uv = v_uv;
+    vec4 instance_emission = v_emission;
     int flags = int( v_flags + 0.5 );
+    if( v_grid > 0.5 ) {
+        ivec2 tile = ivec2( floor( v_world.xy - grid_mapping.xy ) );
+        ivec2 texture_size = textureSize( grid_material_tex, 0 );
+        tile = clamp( tile, ivec2( 0 ), ivec2( texture_size.x / 3, texture_size.y ) - 1 );
+        int material_x = tile.x * 3;
+        vec4 uv_rect = texelFetch( grid_material_tex, ivec2( material_x, tile.y ), 0 );
+        instance_color = texelFetch( grid_material_tex, ivec2( material_x + 1, tile.y ), 0 );
+        vec4 packed = texelFetch( grid_material_tex, ivec2( material_x + 2, tile.y ), 0 );
+        flags = int( packed.x + 0.5 );
+        instance_emission = vec4( packed.yzw, 1.0 );
+        vec2 q = v_uv;
+        int rota = ( flags >> 2 ) & 3;
+        if( rota == 1 ) {
+            q = vec2( q.y, 1.0 - q.x );
+        } else if( rota == 2 ) {
+            q = vec2( 1.0 - q.x, 1.0 - q.y );
+        } else if( rota == 3 ) {
+            q = vec2( 1.0 - q.y, q.x );
+        }
+        instance_uv = mix( uv_rect.xy, uv_rect.zw, q );
+    }
     // Vehicle shells can remain visible to the sun while their near-field 2D
     // skin replaces them on screen.  They must not affect color or camera depth.
     if( ( flags & 32768 ) != 0 ) {
@@ -273,7 +300,7 @@ void main()
     // Same-level walls keep their full geometry, but only the lower third is
     // solid. A stable dither fades the next sixth; the entire upper half is gone.
     if( same_level_wall ) {
-        float wall_h = clamp( v_world.z * effect_params.z, 0.0, 1.0 );
+        float wall_h = clamp( v_tile.z * effect_params.z, 0.0, 1.0 );
         if( wall_h >= 0.5 ) {
             discard;
         }
@@ -343,7 +370,7 @@ void main()
     }
     vec4 sampled = vec4( 1.0 );
     if( textured ) {
-        sampled = texture( atlas_tex, v_uv );
+        sampled = texture( atlas_tex, instance_uv );
         if( !no_discard && sampled.a < 0.1 ) {
             discard;
         }
@@ -358,7 +385,7 @@ void main()
         out_color = vec4( 0.0 );
         return;
     }
-    vec3 display_rgb = v_color.rgb * sampled.rgb;
+    vec3 display_rgb = instance_color.rgb * sampled.rgb;
     vec3 normal = normalize( v_normal );
     if( v_wrap > 0.0 && dot( normal, eye_pos.xyz - v_world ) < 0.0 ) {
         normal = -normal;
@@ -379,8 +406,8 @@ void main()
     }
     // Night vision keeps its own reference palette and brightness hand-over.
     if( nv_params.x > 0.5 ) {
-        vec3 base = textured ? sampled.rgb : v_color.rgb;
-        float light = clamp( v_color.a, 0.0, 1.0 );
+        vec3 base = textured ? sampled.rgb : instance_color.rgb;
+        float light = clamp( instance_color.a, 0.0, 1.0 );
         float av = ( base.r + base.g + base.b ) / 3.0;
         float night = min( av * ( av * 0.75 + 64.0 / 255.0 ) + 16.0 / 255.0, 1.0 );
         float over = min( 64.0 / 255.0 + av * ( av * 0.25 + 192.0 / 255.0 ), 1.0 );
@@ -417,7 +444,7 @@ void main()
     vec3 local_tint = mix( vec3( 1.0 ), scene_light.hue, lighting_params.y );
     vec3 ambient = hemisphere_color * ambient_color.w *
                    ( ambient_occlusion() * light_fill ) * local_tint;
-    vec3 emission = v_emission.rgb *
+    vec3 emission = instance_emission.rgb *
                     ( textured ? color3d_srgb_to_linear( sampled.rgb ) : vec3( 1.0 ) );
     // A transmitting opening is a source of visible sun spill, not merely a
     // surface that happens to face the sun. The high-energy source is kept out

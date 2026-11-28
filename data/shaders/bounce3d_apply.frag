@@ -9,6 +9,7 @@ layout(set = 2, binding = 0) uniform sampler2D bounce_raw_tex;
 layout(set = 2, binding = 1) uniform sampler2D bounce_blur_tex;
 layout(set = 2, binding = 2) uniform sampler2D depth_tex;
 layout(set = 2, binding = 3) uniform sampler2D weather_mask_tex;
+layout(set = 2, binding = 4) uniform sampler2D height_tex;
 
 layout(set = 3, binding = 0) uniform BounceApplyUBO {
     vec4 eye_pos;
@@ -18,8 +19,10 @@ layout(set = 3, binding = 0) uniform BounceApplyUBO {
     vec4 ray_params;   // x = tan(fov/2), y = aspect, z = near, w = far
     vec4 mask_mapping;
     vec4 bounce_params; // x = gain, y/z = distance fade start/end
+    vec4 height_mapping;
 };
 
+#include "heightfield3d.glsl"
 #include "weather3d.glsl"
 
 layout(location = 0) in vec2 v_uv;
@@ -51,7 +54,8 @@ void main()
     }
     float view_depth = linear_depth( depth );
     vec3 world = world_position( v_uv, depth );
-    float indoor = 1.0 - weather_roof_exposure( world );
+    float ground_offset = height_mapping.w > 0.5 ? terrain_height_at( world.xy ) : 0.0;
+    float indoor = 1.0 - weather_roof_exposure( vec3( world.xy, world.z - ground_offset ) );
     float distance_fade = 1.0 - smoothstep( bounce_params.y, bounce_params.z, view_depth );
     if( indoor <= 0.0 || distance_fade <= 0.0 ) {
         out_color = vec4( 0.0 );

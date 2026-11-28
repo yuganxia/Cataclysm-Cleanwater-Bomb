@@ -17,6 +17,9 @@ layout(location = 6) in vec4 a_inst_color;  // rgb = tint / untextured fallback 
 layout(location = 7) in float a_inst_flags; // bit0: textured; bit1: no cutout; bit2-3: top uv rotation; bit4: side strip; bit8: silhouette side
 layout(location = 8) in float a_inst_pad;   // bit4 mode: strip v coordinate (sprite bottom edge)
 layout(location = 9) in vec4 a_inst_emission; // rgb = explicit light-source radiance
+layout(location = 10) in float a_inst_logical_z; // undeformed display-level Z
+
+layout(set = 0, binding = 0) uniform sampler2D height_tex;
 
 layout(set = 1, binding = 0) uniform UBO {
     mat4 mvp;
@@ -26,7 +29,10 @@ layout(set = 1, binding = 0) uniform UBO {
     vec4 sun_dir;    // retained in the shared shadow/terrain vertex UBO layout
     vec4 water_vertex; // xy = map origin, z = seconds, w = wave height amplitude
     vec4 water_flow;   // xy = world wind direction, z = normalized speed
+    vec4 height_mapping; // xy = field origin in scene XY, z = reserved, w = enabled
 };
+
+#include "heightfield3d.glsl"
 
 layout(location = 0) out vec4 v_color;
 layout(location = 1) out vec2 v_uv;
@@ -37,6 +43,7 @@ layout(location = 5) out vec2 v_screen;
 layout(location = 6) out float v_wrap;
 layout(location = 7) out vec3 v_tile;
 layout(location = 8) out vec4 v_emission;
+layout(location = 9) out float v_grid;
 
 void main()
 {
@@ -136,13 +143,19 @@ void main()
             }
         }
     }
-    int water_flags = int( a_inst_flags + 0.5 );
+    int terrain_flags = int( a_inst_flags + 0.5 );
+    if( height_mapping.w > 0.5 && ( terrain_flags & 262144 ) != 0 ) {
+        vec2 anchor_xy = a_inst_pos.xy + 0.5 * a_inst_scale.xy;
+        world.z += terrain_height_at( world.xy ) - terrain_height_at( anchor_xy );
+        normal = terrain_height_normal( world.xy );
+    }
+    int water_flags = terrain_flags;
     if( water_vertex.w > 0.0 && ( water_flags & 16384 ) != 0 &&
         ( mode == 5 || ( mode == 0 && a_aux.z > 0.5 ) ) ) {
         world.z += water_wave_height( world.xy + water_vertex.xy, water_flow.xy,
                                       water_vertex.z, water_vertex.w, water_flow.z );
     }
-    v_tile = a_inst_pos;
+    v_tile = vec3( a_inst_pos.xy, a_inst_logical_z );
     v_normal = normal;
     v_wrap = wrap;
     v_world = world;
@@ -158,4 +171,5 @@ void main()
     }
     v_flags = float( out_flags );
     v_emission = a_inst_emission;
+    v_grid = 0.0;
 }

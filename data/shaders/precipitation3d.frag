@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 layout(set = 2, binding = 0) uniform sampler2D weather_mask_tex;
+layout(set = 2, binding = 1) uniform sampler2D height_tex;
 
 layout(set = 3, binding = 0) uniform PrecipFragUBO {
     mat4 view_proj;
@@ -13,7 +14,10 @@ layout(set = 3, binding = 0) uniform PrecipFragUBO {
     vec4 mask_mapping;
     vec4 cam_right;
     vec4 cam_up;
+    vec4 height_mapping;
 };
+
+#include "heightfield3d.glsl"
 
 #include "weather3d.glsl"
 
@@ -34,7 +38,9 @@ void main()
     } else {
         shape = 1.0 - smoothstep( 0.30, 1.0, length( v_uv * 2.0 - 1.0 ) );
     }
-    float alpha = v_alpha * shape * weather_roof_exposure( v_world );
+    float ground_offset = height_mapping.w > 0.5 ? terrain_height_at( v_world.xy ) : 0.0;
+    float alpha = v_alpha * shape * weather_roof_exposure(
+                      vec3( v_world.xy, v_world.z - ground_offset ) );
     if( alpha < 0.003 ) {
         discard;
     }
